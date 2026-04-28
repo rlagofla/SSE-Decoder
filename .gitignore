@@ -1,0 +1,6 @@
+doc/
+build/
+tmp/
+out/
+src/__pycache__/
+data/
