@@ -6,7 +6,7 @@ src/__pycache__/
 py/__pycache__/
 data/
 libs/
-
+.cache/
 
 CMakeLists.txt
 .DS_Store
