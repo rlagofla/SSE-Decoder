@@ -202,9 +202,58 @@ void emitHuman(const sse95803::TickRecord& r, uint32_t outer_seq,
     }
 }
 
+// ---- Type='S' (TradingPhaseCode) 状态记录 emit ----
+
+void emitStatBiz(const sse95803::StatusRecord& s, uint32_t outer_seq,
+                 uint32_t frame_idx) {
+    printBizCsvHeaderOnce();
+    std::string tt = s.has_transact_time
+                         ? sse95803::fmtTickTime(s.transact_time)
+                         : "";
+    // BizIndex/Channel 对状态记录无意义, 用 outer_seq 作为临时序号
+    std::cout << outer_seq << ','           // BizIndex (用帧序号代替)
+              << 1 << ','                   // Channel (单通道广播)
+              << s.security_id << ','
+              << tt << ','
+              << 'S' << ','
+              << "0,0,0.000,0,0.000,"       // BuyNO,SellNO,Price,Qty,Money
+              << s.trading_phase << ','
+              << '.' << ','                 // ExtCode
+              << outer_seq << ',' << frame_idx << ',' << 0 << '\n';
+}
+
+void emitStatHuman(const sse95803::StatusRecord& s, uint32_t outer_seq,
+                   const std::string& stream_tag, uint32_t frame_idx) {
+    std::cout << "\n[stat] " << stream_tag
+              << "  frame#" << frame_idx
+              << "  outer_seq=" << outer_seq << "\n"
+              << "  SecurityID     = " << s.security_id << "\n"
+              << "  TradingPhase   = " << s.trading_phase << "\n";
+    if (s.has_transact_time)
+        std::cout << "  TransactTime   = " << sse95803::fmtTickTime(s.transact_time)
+                  << " (" << s.transact_time << ")\n";
+    if (!s.prefix_ints.empty()) {
+        std::cout << "  FrameSeq       =";
+        for (auto v : s.prefix_ints) std::cout << ' ' << v;
+        std::cout << '\n';
+    }
+}
+
 void emitRecord(const sse95803::TickRecord& r, uint32_t outer_seq,
                 const std::string& stream_tag, uint32_t frame_idx,
                 size_t rec_idx) {
+    // action==0 → 尝试解析为 Type='S' 状态记录
+    if (r.action == 0) {
+        sse95803::StatusRecord sr;
+        if (sse95803::decodeStat(r, sr)) {
+            switch (g_mode) {
+                case OutMode::BizCsv: emitStatBiz(sr, outer_seq, frame_idx);              break;
+                case OutMode::Human:  emitStatHuman(sr, outer_seq, stream_tag, frame_idx); break;
+                case OutMode::RawCsv: emitRaw(r, outer_seq, frame_idx, rec_idx);          break;
+            }
+            return;
+        }
+    }
     switch (g_mode) {
         case OutMode::BizCsv: emitBiz(r, outer_seq, frame_idx); break;
         case OutMode::RawCsv: emitRaw(r, outer_seq, frame_idx, rec_idx); break;

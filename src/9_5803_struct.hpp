@@ -73,11 +73,26 @@ inline bool tryReadAsciiSecID(const uint8_t* p, size_t n, std::string& out) {
     return true;
 }
 
+// 把 FAST stop-bit 字节序列还原为 ASCII 字符串 (每 7bit 一个字符, 大端序)
+// "SUSP" 编码成 FAST uint = 175466960, 反向提取得 "SUSP"
+inline std::string fastIntToAscii(uint64_t v) {
+    if (v == 0) return "";
+    std::string s;
+    while (v > 0) {
+        s += char(v & 0x7F);
+        v >>= 7;
+    }
+    std::reverse(s.begin(), s.end());
+    return s;
+}
+
 // 一条记录的解析结果 (不拷贝源字节, 仅保存 raw 指针)
 struct TickRecord {
     const uint8_t* raw     = nullptr;
     size_t         raw_len = 0;
 
+    // PMAP: pmap_bytes 含完整字节序列 (1B 或 2B), pmap 为末字节 (向后兼容)
+    std::vector<uint8_t> pmap_bytes;
     uint8_t   pmap        = 0;
     uint64_t  template_id = 0;  // 期望 = 5803
 
@@ -109,8 +124,6 @@ class TickStreamParser {
 public:
     TickStreamParser(const uint8_t* body, size_t len)
         : body_(body), len_(len) {
-        // 这里意思是说，TID 是 Template id，这个5803正好也是sub channel，表示就是逐条行情的template，按照这个tid解析后面的字段
-
         // 扫 2d ab (= TID=5803 的 FAST 编码). 要求:
         //   1. i >= 1 (前面得有 PMAP 字节)
         //   2. body[i-1] 必须是 FAST stop-bit 字节 (MSB=1), 这是 PMAP 的基本要求
@@ -122,6 +135,7 @@ public:
             if (!tid_pos_.empty() && i - tid_pos_.back() < 14) continue;
             tid_pos_.push_back(i);
         }
+
     }
 
     size_t record_count() const { return tid_pos_.size(); }
@@ -134,10 +148,11 @@ public:
         size_t tid = tid_pos_[idx];
         if (tid == 0) return false;
 
-        // PMAP 固定 1 字节, 位于 TID 前一个字节
+        // PMAP 固定取 TID 前一字节 (stop-bit byte)。2B PMAP 的第一字节 (如 `48`)
+        // 被算在上一条记录的尾部, 对当前解析无影响 (SecID/ints 从 off=3 开始扫描)。
         size_t start = tid - 1;
 
-        // 记录末尾 = 下一条 PMAP 位置 (1B), 或 body 末尾
+        // 记录末尾 = 下一条 PMAP 位置, 或 body 末尾
         size_t end = (idx + 1 < tid_pos_.size())
                          ? (tid_pos_[idx + 1] - 1)
                          : len_;
@@ -146,7 +161,8 @@ public:
         rec.raw     = body_ + start;
         rec.raw_len = end - start;
 
-        rec.pmap = body_[start];
+        rec.pmap_bytes = {body_[start]};   // 末 PMAP 字节 (2B PMAP 仅保留末字节)
+        rec.pmap       = body_[start];
 
         auto [tv, tn] = readFast(body_ + start + 1, rec.raw_len - 1);
         if (tn == 0) return false;
@@ -208,7 +224,9 @@ public:
                 rec.has_bs_flag = true;
                 rec.bs_flag     = char(last & 0x7F);
                 tail_len        = 1;
-            } else if (rec.raw_len >= off + 1) {
+            } else if (rec.raw_len >= off + 1 && !(last & 0x80)) {
+                // ExtCode 是 raw 字节 (MSB=0, 例如 0x4A); 若末字节带 stop-bit
+                // 则它是 FAST ASCII 字串的终止符, 不是 ExtCode, 留给 ints 解析。
                 rec.has_ext  = true;
                 rec.ext_code = last;
                 tail_len     = 1;
@@ -290,6 +308,59 @@ struct TickBusiness {
     uint8_t     ext_code   = 0;     // ExtCode 原始字节
     bool        valid      = false; // 解码成功
 };
+
+// ---- Type='S' (TradingPhaseCode) 状态记录 ----
+//
+// head5.pcap 结构 (三种 PMAP, 共 3781 条记录/流):
+//
+//   PMAP `48 84` [bits 0,3,11]:    SecID → TradingPhaseCode
+//   PMAP `4c 84` [bits 0,3,4,11]:  SecID → TransactTime → TradingPhaseCode
+//   PMAP `7e 84` [bits 0..5,11]:   SeqA → SeqB → SecID → TransactTime → 83(常量) → TradingPhaseCode
+//
+// TradingPhaseCode 用 FAST ASCII stop-bit 编码: "SUSP"=175466960, "OCALL"=..., "START"=...
+// TransactTime 格式: HHMMSScc (百分秒), e.g. 9140027 = 09:14:00.27
+//
+struct StatusRecord {
+    bool        valid             = false;
+    std::string security_id;
+    bool        has_transact_time = false;
+    uint32_t    transact_time     = 0;  // HHMMSScc, 同 TickBusiness::tick_time
+    std::string trading_phase;          // "SUSP" / "OCALL" / "START"
+    // 7e84 帧首记录的前缀序号 (SeqA = prefix[0], SeqB = prefix[1])
+    std::vector<uint64_t> prefix_ints;
+};
+
+// 判断一个 TickRecord (action==0) 是否为 Type='S' 状态记录并解析。
+// 依据: 最后一个 middle_int 反向解码为已知状态字符串。
+inline bool decodeStat(const TickRecord& rec, StatusRecord& out) {
+    out = StatusRecord{};
+    if (rec.action != 0)    return false;   // 有 action → 不是状态记录
+    if (rec.ints.empty())   return false;
+
+    // 最后一个 FAST int = TradingPhaseCode 的 7bit 大端编码
+    std::string phase = fastIntToAscii(rec.ints.back());
+    if (phase != "SUSP" && phase != "OCALL" && phase != "START") return false;
+
+    out.security_id   = rec.security_id;
+    out.trading_phase = phase;
+    out.prefix_ints   = rec.prefix_ints;
+
+    // 推断 TransactTime:
+    //   ints=[status]              → 无时间 (4884)
+    //   ints=[time, status]        → 有时间 (4c84)
+    //   ints=[time, 83, status]    → 有时间 + 常量 83 (7e84)
+    const size_t n = rec.ints.size();
+    if (n == 2) {
+        out.has_transact_time = true;
+        out.transact_time     = uint32_t(rec.ints[0]);
+    } else if (n >= 3 && rec.ints[n - 2] == 83) {
+        out.has_transact_time = true;
+        out.transact_time     = uint32_t(rec.ints[n - 3]);
+    }
+
+    out.valid = true;
+    return true;
+}
 
 // FAST nullable 解码: V==0 → NULL (is_null=true), 否则 V-1
 inline std::pair<uint64_t, bool> decNull(uint64_t enc) {
