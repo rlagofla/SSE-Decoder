@@ -3,7 +3,10 @@ build/
 tmp/
 out/
 src/__pycache__/
+py/__pycache__/
 data/
+libs/
+
 
 CMakeLists.txt
 .DS_Store
