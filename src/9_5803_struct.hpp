@@ -109,6 +109,8 @@ class TickStreamParser {
 public:
     TickStreamParser(const uint8_t* body, size_t len)
         : body_(body), len_(len) {
+        // 这里意思是说，TID 是 Template id，这个5803正好也是sub channel，表示就是逐条行情的template，按照这个tid解析后面的字段
+
         // 扫 2d ab (= TID=5803 的 FAST 编码). 要求:
         //   1. i >= 1 (前面得有 PMAP 字节)
         //   2. body[i-1] 必须是 FAST stop-bit 字节 (MSB=1), 这是 PMAP 的基本要求

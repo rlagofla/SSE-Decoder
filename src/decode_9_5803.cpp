@@ -84,6 +84,7 @@ OutMode  g_mode = OutMode::Human;
 // TickStreamParser 是 per-frame 的, 跨帧继承由 BusinessState 维护。
 // 每条 TCP 流 (每个 Channel) 有独立一份状态, 挂在 Splitter 里。
 sse95803::BusinessState* g_cur_state = nullptr;
+bool                     g_done      = false;
 
 void printBizCsvHeaderOnce() {
     static bool done = false;
@@ -304,7 +305,7 @@ private:
         if (hi != kWantHi || lo != kWantLo) return;
 
         ++frame_idx_;
-        if (max_frames > 0 && printed_ >= max_frames) return;
+        if (max_frames > 0 && printed_ >= max_frames) { g_done = true; return; }
         ++printed_;
         g_cur_state = &biz_state;
         decodeFrame(f, length, stream_tag, frame_idx_);
@@ -377,7 +378,7 @@ int main(int argc, char** argv) {
 
     pcpp::TcpReassembly reassembly(onTcpData, &ctx, onConnStart, onConnEnd);
     pcpp::RawPacket     raw;
-    while (reader.getNextPacket(raw)) reassembly.reassemblePacket(&raw);
+    while (!g_done && reader.getNextPacket(raw)) reassembly.reassemblePacket(&raw);
     reassembly.closeAllConnections();
     reader.close();
     return 0;
