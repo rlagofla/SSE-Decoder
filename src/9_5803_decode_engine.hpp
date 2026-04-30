@@ -210,15 +210,15 @@ void emitStatBiz(const sse95803::StatusRecord& s, uint32_t outer_seq,
     std::string tt = s.has_transact_time
                          ? sse95803::fmtTickTime(s.transact_time)
                          : "";
-    // BizIndex/Channel 对状态记录无意义, 用 outer_seq 作为临时序号
-    std::cout << outer_seq << ','           // BizIndex (用帧序号代替)
-              << 1 << ','                   // Channel (单通道广播)
+    // Type='S' 的 FAST 报文中没有 BizIndex/Channel/价量字段, 统一留空
+    std::cout << ','                  // BizIndex (FAST 中不存在)
+              << ','                  // Channel  (FAST 中不存在)
               << s.security_id << ','
               << tt << ','
               << 'S' << ','
-              << "0,0,0.000,0,0.000,"       // BuyNO,SellNO,Price,Qty,Money
+              << ",,,,,"              // BuyNO,SellNO,Price,Qty,Money (不适用)
               << s.trading_phase << ','
-              << '.' << ','                 // ExtCode
+              << ','                  // ExtCode  (不适用)
               << outer_seq << ',' << frame_idx << ',' << 0 << '\n';
 }
 
