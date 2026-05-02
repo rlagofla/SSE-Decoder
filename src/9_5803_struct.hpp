@@ -1,42 +1,22 @@
 #pragma once
-// 9_5803_struct.hpp — 上交所 (9, 5803) 通道逐笔行情 (成交 + 委托 混合) 结构
+// 9_5803_struct.hpp — 上交所 (9, 5803) 通道逐笔行情 PMAP 驱动顺序解码
 //
-// 通道身份确认: 参考《上海证券交易所LDDS系统竞价Level-2行情接口说明书》v2.0.8
-// (2023/03/13), 本通道模板 5803 是 UA5801 (逐笔委托) + UA3201 (逐笔成交) 合并后
-// 的统一流, 每条记录通过 1B ASCII Action 字符 ('A'/'D'/'T'/'C') 区分事件类型。
+// PMAP 位布局（14 bits，高 7 位来自第 1 字节，低 7 位来自 stop-bit 字节）:
+//   bit 0 : TID          (1 = 读 2d ab)
+//   bit 1 : BizIndex     (0 = last+1,  1 = 显式 FAST u64)
+//   bit 2 : Channel      (0 = copy,    1 = 显式 FAST u32)
+//   bit 3 : SecurityID   (0 = copy,    1 = 显式 6B ASCII)
+//   bit 4 : TickTime     (0 = copy,    1 = 显式 FAST u32 nullable)
+//   bit 5 : Action       (0 = copy,    1 = 显式 FAST char)
+//   bit 6 : BuyOrderNO   (0 = 0,       1 = 显式 FAST u64 nullable)
+//   bit 7 : SellOrderNO  (0 = 0,       1 = 显式 FAST u64 nullable)
+//   bit 8 : Price        (0 = 0,       1 = 显式 FAST u32 nullable)
+//   bit 9 : Qty          (0 = 0,       1 = 显式 FAST u64 nullable)
+//   bit 10: TradeMoney   (0 = 0,       1 = 显式 FAST u64 nullable)
+//   bit 11: BSFlag       (0 = copy,    1 = 显式 FAST char)
 //
-// ---- 字节层结构 ----
-//
-//   PMAP          (1B, MSB=1 停止) —— 7 bit 位图, 控制后续 copy/default 字段是否出现
-//   TemplateID    (2B FAST = 5803, 即 `2d ab`)
-//   [BizIndex]    (FAST u64 mandatory, 业务序列号) —— 帧首记录出现
-//   [Channel]     (FAST u32 mandatory, 通道号)     —— 帧首记录出现
-//   [SecurityID]  (6B ASCII, 前 5 字节 '0'..'9' MSB=0, 第 6 字节 MSB=1)
-//                                                   —— 首次 + 证券切换时出现
-//   [OrderTime]   (FAST u32 **nullable**, 行情时间 HHMMSSXX, e.g. 9535063 = 09:53:50.63)
-//   [Action]      (1B FAST char, 'T'/'A'/'D'/'C')   —— 缺失则继承上一条
-//   中间 FAST 整数序列 (随 Action 不同):
-//     'A' (新增委托):  OrderNO(u64 null), Price(u32 null ×1000), Qty(u64 null ×1000),
-//                     TradeMoney(u64 null ×1e5, 恒为 0, 有时省略)
-//     'D' (撤单):      OrderNO(u64 null), Price(u32 null ×1000), Qty(u64 null ×1000)
-//     'C' (取消):      同 'D'
-//     'T' (成交):      BidApplSeq(u64 null), TradeApplSeq/OfferApplSeq(u64 null),
-//                     Price(u32 null ×1000), Qty(u64 null ×1000), TradeMoney(u64 null ×1e5)
-//   BSFlag        (1B FAST char, 'B' / 'S' / 'N', 编码值 0xC2 / 0xD3 / 0xCE)
-//   ExtCode       (1B RAW, 取值 'A'/'H'/'I'/'J'/'K'/'N' 等, 可能是帧尾分类字节)
-//
-// ---- FAST nullable 关键规则 ----
-//
-// 所有标注 "null" 的字段是 FAST 可空整数: 编码值 V 表示
-//   V == 0x80 (编码 0, stop 置位)  →  NULL / 缺省
-//   V >  0                         →  真实值 = V - 1
-// 所以 pcap 里的原始值一律比 CSV 业务数值大 1, 这是编码, 不是 off-by-one bug。
-//
-// ---- 价格/数量精度 ----
-//
-//   Price       : STEP 三位小数 "6.330" → FAST 存整数 6330 → nullable 编码 6331
-//   Qty         : STEP 三位小数 "1100.000" (实际 1100 股) → FAST 存 1100000 → 编码 1100001
-//   TradeMoney  : STEP 五位小数 "73716.34000" → FAST 存 7371634000 → 编码 7371634001
+// FAST nullable: 编码值 V=0 → NULL(缺省/0), V>0 → 业务值 = V-1
+// 注: 所谓 "ExtCode" 根本不存在，它是下一条记录 PMAP 的第一字节。
 
 #include <cstddef>
 #include <cstdint>
@@ -46,8 +26,7 @@
 
 namespace sse95803 {
 
-// FAST stop-bit 变长无符号整数解码。
-// 返回 {value, 消耗字节数}; 未遇 stop-bit 则返回 {acc, 0}。
+// FAST stop-bit 变长无符号整数解码
 inline std::pair<uint64_t, size_t> readFast(const uint8_t* p, size_t n) {
     uint64_t v = 0;
     for (size_t i = 0; i < n; ++i) {
@@ -57,7 +36,7 @@ inline std::pair<uint64_t, size_t> readFast(const uint8_t* p, size_t n) {
     return {v, 0};
 }
 
-// 识别 6 字节 ASCII 证券代码: 前 5 字节 '0'..'9' (MSB=0), 第 6 字节 MSB=1 且低 7bit 为 '0'..'9'。
+// 识别 6 字节 ASCII 证券代码
 inline bool tryReadAsciiSecID(const uint8_t* p, size_t n, std::string& out) {
     if (n < 6) return false;
     for (size_t i = 0; i < 5; ++i) {
@@ -73,8 +52,7 @@ inline bool tryReadAsciiSecID(const uint8_t* p, size_t n, std::string& out) {
     return true;
 }
 
-// 把 FAST stop-bit 字节序列还原为 ASCII 字符串 (每 7bit 一个字符, 大端序)
-// "SUSP" 编码成 FAST uint = 175466960, 反向提取得 "SUSP"
+// FAST int → ASCII 字符串（用于 TradingPhaseCode）
 inline std::string fastIntToAscii(uint64_t v) {
     if (v == 0) return "";
     std::string s;
@@ -86,424 +64,273 @@ inline std::string fastIntToAscii(uint64_t v) {
     return s;
 }
 
-// 一条记录的解析结果 (不拷贝源字节, 仅保存 raw 指针)
-struct TickRecord {
-    const uint8_t* raw     = nullptr;
-    size_t         raw_len = 0;
-
-    // PMAP: pmap_bytes 含完整字节序列 (1B 或 2B), pmap 为末字节 (向后兼容)
-    std::vector<uint8_t> pmap_bytes;
-    uint8_t   pmap        = 0;
-    uint64_t  template_id = 0;  // 期望 = 5803
-
-    // SecurityID: 若 has_security_id=false 则 security_id 来自继承
-    bool         has_security_id = false;
-    std::string  security_id;
-
-    // Action: 若 has_action=false 则 action 来自继承
-    bool  has_action = false;
-    char  action     = 0;  // 'T' / 'A' / 'D' / 'C' / 0
-
-    // 帧级前导字段 (仅首条记录有, 位于 TID~SecID 或 SecID~Action 之间)
-    std::vector<uint64_t> prefix_ints;
-    std::vector<size_t>   prefix_widths;
-
-    // 中间 FAST int 字段 (位于 Action 之后, 尾部之前)
-    std::vector<uint64_t> ints;
-    std::vector<size_t>   widths;
-
-    // 尾部
-    bool    has_bs_flag = false;
-    char    bs_flag     = 0;  // 'B' / 'S' / 'N'
-    bool    has_ext     = false;
-    uint8_t ext_code    = 0;
-};
-
-// 按 `2d ab` TID 标记拆解码后 body 为一条条 TickRecord
-class TickStreamParser {
-public:
-    TickStreamParser(const uint8_t* body, size_t len)
-        : body_(body), len_(len) {
-        // 扫 2d ab (= TID=5803 的 FAST 编码). 要求:
-        //   1. i >= 1 (前面得有 PMAP 字节)
-        //   2. body[i-1] 必须是 FAST stop-bit 字节 (MSB=1), 这是 PMAP 的基本要求
-        //   3. 与上一个 tid_pos_ 至少间隔 14B (最短合法记录体量)
-        // 以上三条能过滤绝大多数"字段值 = 5803"导致的伪 TID 命中。
-        for (size_t i = 1; i + 1 < len_; ++i) {
-            if (body_[i] != 0x2d || body_[i + 1] != 0xab) continue;
-            if (!(body_[i - 1] & 0x80)) continue;
-            if (!tid_pos_.empty() && i - tid_pos_.back() < 14) continue;
-            tid_pos_.push_back(i);
-        }
-
-    }
-
-    size_t record_count() const { return tid_pos_.size(); }
-
-    // 解析第 idx 条记录 (从 0 开始)。会继承前一条的 SecID/Action。
-    bool parse(size_t idx, TickRecord& rec) {
-        rec = TickRecord{};  // 清空
-        if (idx >= tid_pos_.size()) return false;
-
-        size_t tid = tid_pos_[idx];
-        if (tid == 0) return false;
-
-        // PMAP 固定取 TID 前一字节 (stop-bit byte)。2B PMAP 的第一字节 (如 `48`)
-        // 被算在上一条记录的尾部, 对当前解析无影响 (SecID/ints 从 off=3 开始扫描)。
-        size_t start = tid - 1;
-
-        // 记录末尾 = 下一条 PMAP 位置, 或 body 末尾
-        size_t end = (idx + 1 < tid_pos_.size())
-                         ? (tid_pos_[idx + 1] - 1)
-                         : len_;
-        if (end <= start + 3) return false;
-
-        rec.raw     = body_ + start;
-        rec.raw_len = end - start;
-
-        rec.pmap_bytes = {body_[start]};   // 末 PMAP 字节 (2B PMAP 仅保留末字节)
-        rec.pmap       = body_[start];
-
-        auto [tv, tn] = readFast(body_ + start + 1, rec.raw_len - 1);
-        if (tn == 0) return false;
-        rec.template_id = tv;
-
-        size_t off = 1 + tn;  // 相对 start 的偏移
-
-        // 尝试 6B ASCII SecID。
-        // 一般记录 SecID 紧随 TID; 但每帧首条可能有帧级前导 FAST 字段 (frame seq / flag),
-        // 这里允许跳过 0~3 个前导 FAST 字段再找 ASCII SecID。
-        std::string sid;
-        size_t scan_off = off;
-        for (int attempt = 0; attempt < 4 && scan_off + 6 <= rec.raw_len; ++attempt) {
-            if (tryReadAsciiSecID(body_ + start + scan_off,
-                                  rec.raw_len - scan_off, sid)) {
-                // 保存前导 FAST 字段 (仅帧首记录存在)
-                size_t cursor = off;
-                while (cursor < scan_off) {
-                    auto [v, w] = readFast(body_ + start + cursor,
-                                           scan_off - cursor);
-                    if (w == 0) break;
-                    rec.prefix_ints.push_back(v);
-                    rec.prefix_widths.push_back(w);
-                    cursor += w;
-                }
-                rec.has_security_id = true;
-                rec.security_id     = sid;
-                off = scan_off + 6;
-                cur_sec_ = sid;
-                break;
-            }
-            auto [v, w] = readFast(body_ + start + scan_off,
-                                   rec.raw_len - scan_off);
-            if (w == 0) break;
-            scan_off += w;
-        }
-        if (!rec.has_security_id) {
-            rec.security_id = cur_sec_;
-        }
-
-        // 探测尾部: 优先匹配 2B tail [BSFlag + ExtCode], 否则看末尾 1B 是 BSFlag 还是 ExtCode
-        size_t tail_len = 0;
-        auto isBSChar = [](uint8_t b) {
-            if (!(b & 0x80)) return false;
-            uint8_t c = b & 0x7F;
-            return c == 'B' || c == 'S' || c == 'N';
-        };
-        if (rec.raw_len >= off + 2) {
-            uint8_t last   = body_[start + rec.raw_len - 1];
-            uint8_t second = body_[start + rec.raw_len - 2];
-            if (isBSChar(second)) {
-                rec.has_bs_flag = true;
-                rec.bs_flag     = char(second & 0x7F);
-                rec.has_ext     = true;
-                rec.ext_code    = last;
-                tail_len        = 2;
-            } else if (isBSChar(last)) {
-                // 短记录: 只有 BSFlag, 没有 ExtCode
-                rec.has_bs_flag = true;
-                rec.bs_flag     = char(last & 0x7F);
-                tail_len        = 1;
-            } else if (rec.raw_len >= off + 1 && !(last & 0x80)) {
-                // ExtCode 是 raw 字节 (MSB=0, 例如 0x4A); 若末字节带 stop-bit
-                // 则它是 FAST ASCII 字串的终止符, 不是 ExtCode, 留给 ints 解析。
-                rec.has_ext  = true;
-                rec.ext_code = last;
-                tail_len     = 1;
-            }
-        }
-
-        // 尝试 Action (紧随 SecID); 允许跳过 0~2 个前导 FAST 字段
-        // (首条记录 SecID 和 Action 之间可能有额外帧级字段)
-        {
-            size_t scan_off = off;
-            for (int attempt = 0; attempt < 3 && scan_off < rec.raw_len - tail_len;
-                 ++attempt) {
-                uint8_t b = body_[start + scan_off];
-                if ((b & 0x80)) {
-                    uint8_t c = b & 0x7F;
-                    if (c == 'T' || c == 'A' || c == 'D' || c == 'C') {
-                        // SecID 与 Action 之间的跳过字段也归为帧级前导
-                        size_t cursor = off;
-                        while (cursor < scan_off) {
-                            auto [v, w] = readFast(body_ + start + cursor,
-                                                   scan_off - cursor);
-                            if (w == 0) break;
-                            rec.prefix_ints.push_back(v);
-                            rec.prefix_widths.push_back(w);
-                            cursor += w;
-                        }
-                        rec.has_action = true;
-                        rec.action     = char(c);
-                        off = scan_off + 1;
-                        cur_action_ = rec.action;
-                        break;
-                    }
-                }
-                auto [v, w] = readFast(body_ + start + scan_off,
-                                       rec.raw_len - tail_len - scan_off);
-                if (w == 0) break;
-                scan_off += w;
-            }
-        }
-        if (!rec.has_action) rec.action = cur_action_;
-
-        // 中间 FAST 整数字段 (直到 mid_end)
-        size_t mid_end = rec.raw_len - tail_len;
-        while (off < mid_end) {
-            auto [v, w] = readFast(body_ + start + off, mid_end - off);
-            if (w == 0) break;
-            rec.ints.push_back(v);
-            rec.widths.push_back(w);
-            off += w;
-        }
-        return true;
-    }
-
-private:
-    const uint8_t*      body_;
-    size_t              len_;
-    std::vector<size_t> tid_pos_;
-    std::string         cur_sec_;
-    char                cur_action_ = 0;
-};
-
-// ---- 业务层解码 ----
-//
-// TickBusiness: 一条记录的业务语义, 字段名对齐通联 CSV (mdl_4_24_0.csv):
-//   BizIndex, Channel, SecurityID, TickTime, Type,
-//   BuyOrderNO, SellOrderNO, Price, Qty, TradeMoney, TickBSFlag, ExtCode
-struct TickBusiness {
-    uint64_t    biz_index  = 0;     // 业务序号 (与 CSV BizIndex 对齐)
-    uint32_t    channel    = 0;     // 通道号
-    std::string security_id;        // "601106" etc
-    uint32_t    tick_time  = 0;     // HHMMSSXX, 9535063 = 09:53:50.63
-    char        type       = 0;     // 'A'/'D'/'T'/'C'
-    uint64_t    buy_order_no  = 0;  // 'A'/'D'+BS='B' 填此, 'T' 填 BidApplSeq
-    uint64_t    sell_order_no = 0;  // 'A'/'D'+BS='S' 填此, 'T' 填 OfferApplSeq
-    int64_t     price_e3   = 0;     // Price × 1000 (STEP 三位小数的整数表达)
-    int64_t     qty_e3     = 0;     // Qty   × 1000
-    int64_t     money_e5   = 0;     // TradeMoney × 10^5
-    char        bs_flag    = 0;     // 'B'/'S'/'N'
-    uint8_t     ext_code   = 0;     // ExtCode 原始字节
-    bool        valid      = false; // 解码成功
-};
-
-// ---- Type='S' (TradingPhaseCode) 状态记录 ----
-//
-// head5.pcap 结构 (三种 PMAP, 共 3781 条记录/流):
-//
-//   PMAP `48 84` [bits 0,3,11]:    SecID → TradingPhaseCode
-//   PMAP `4c 84` [bits 0,3,4,11]:  SecID → TransactTime → TradingPhaseCode
-//   PMAP `7e 84` [bits 0..5,11]:   SeqA → SeqB → SecID → TransactTime → 83(常量) → TradingPhaseCode
-//
-// TradingPhaseCode 用 FAST ASCII stop-bit 编码: "SUSP"=175466960, "OCALL"=..., "START"=...
-// TransactTime 格式: HHMMSScc (百分秒), e.g. 9140027 = 09:14:00.27
-//
-struct StatusRecord {
-    bool        valid             = false;
-    std::string security_id;
-    bool        has_transact_time = false;
-    uint32_t    transact_time     = 0;  // HHMMSScc, 同 TickBusiness::tick_time
-    std::string trading_phase;          // "SUSP" / "OCALL" / "START"
-    // 7e84 帧首记录的前缀序号 (SeqA = prefix[0], SeqB = prefix[1])
-    std::vector<uint64_t> prefix_ints;
-};
-
-// 判断一个 TickRecord (action==0) 是否为 Type='S' 状态记录并解析。
-// 依据: 最后一个 middle_int 反向解码为已知状态字符串。
-inline bool decodeStat(const TickRecord& rec, StatusRecord& out) {
-    out = StatusRecord{};
-    if (rec.action != 0)    return false;   // 有 action → 不是状态记录
-    if (rec.ints.empty())   return false;
-
-    // 最后一个 FAST int = TradingPhaseCode 的 7bit 大端编码
-    std::string phase = fastIntToAscii(rec.ints.back());
-    if (phase != "SUSP" && phase != "OCALL" && phase != "START") return false;
-
-    out.security_id   = rec.security_id;
-    out.trading_phase = phase;
-    out.prefix_ints   = rec.prefix_ints;
-
-    // 推断 TransactTime:
-    //   ints=[status]              → 无时间 (4884)
-    //   ints=[time, status]        → 有时间 (4c84)
-    //   ints=[time, 83, status]    → 有时间 + 常量 83 (7e84)
-    const size_t n = rec.ints.size();
-    if (n == 2) {
-        out.has_transact_time = true;
-        out.transact_time     = uint32_t(rec.ints[0]);
-    } else if (n >= 3 && rec.ints[n - 2] == 83) {
-        out.has_transact_time = true;
-        out.transact_time     = uint32_t(rec.ints[n - 3]);
-    }
-
-    out.valid = true;
-    return true;
-}
-
-// FAST nullable 解码: V==0 → NULL (is_null=true), 否则 V-1
+// FAST nullable 解码: V==0 → NULL(返回0), V>0 → V-1
 inline std::pair<uint64_t, bool> decNull(uint64_t enc) {
     if (enc == 0) return {0, true};
     return {enc - 1, false};
 }
 
-// 跨记录状态, 承载 increment/copy 操作符继承
-struct BusinessState {
-    uint64_t last_biz_index = 0;
-    uint32_t last_channel   = 0;
-    uint32_t last_tick_time = 0;
-    // SecurityID 和 Action 的继承由 TickStreamParser 内部处理
+// 读取 stop-bit 终止的 PMAP，最多支持 2 字节（14 bits）
+// FAST 规范：payload 内 MSB 优先，即第 1 字节 bit6 → PMAP position 0，bit5 → position 1，…
+// 第 2 字节（stop-bit 字节）bit6 → PMAP position 7，…，bit2 → position 11
+inline bool readPmap(const uint8_t* p, size_t n, uint16_t& bits, size_t& consumed) {
+    bits = 0;
+    consumed = 0;
+    for (size_t i = 0; i < n && i < 2; ++i) {
+        uint8_t b = p[i];
+        uint8_t payload = b & 0x7F;
+        // 将 7-bit payload 按 MSB-first 映射到 PMAP positions i*7 .. i*7+6
+        for (int j = 0; j < 7; ++j) {
+            if ((payload >> (6 - j)) & 1)
+                bits |= uint16_t(1u << (i * 7 + j));
+        }
+        consumed = i + 1;
+        if (b & 0x80) return true;
+    }
+    return consumed > 0 && (p[consumed - 1] & 0x80);
+}
+
+// 一条解码后的记录（业务字段直接命名，无需二次转换）
+struct TickRecord {
+    uint16_t    pmap_raw     = 0;  // 14-bit PMAP payload（调试）
+    uint64_t    template_id  = 0;  // 期望 5803
+
+    uint64_t    biz_index    = 0;
+    uint32_t    channel      = 0;
+    std::string security_id;
+    uint32_t    tick_time    = 0;  // HHMMSSXX，已做 nullable -1
+    char        action       = 0;  // 'A'/'D'/'T'/'C'
+    uint64_t    buy_order_no  = 0;
+    uint64_t    sell_order_no = 0;
+    int64_t     price_e3     = 0;  // Price × 1000
+    int64_t     qty_e3       = 0;  // Qty × 1000
+    int64_t     money_e5     = 0;  // TradeMoney × 10^5
+    char        bs_flag      = 0;  // 'B'/'S'/'N'
+
+    bool is_status_record = false;
+    bool valid            = false;
 };
 
-// 按 Action 约定返回中间字段预期数量 ('A' 可为 3 或 4, 'D'/'C' 为 3, 'T' 为 5)
-inline size_t expectedMiddleCount(char action, size_t avail) {
-    switch (action) {
-        case 'A': return (avail >= 4) ? 4 : 3;
-        case 'D':
-        case 'C': return 3;
-        case 'T': return 5;
-        default:  return 0;
-    }
-}
+// Type='S' 状态记录
+struct StatusRecord {
+    bool        valid             = false;
+    std::string security_id;
+    bool        has_transact_time = false;
+    uint32_t    transact_time     = 0;
+    std::string trading_phase;           // "SUSP"/"OCALL"/"START"
+    std::vector<uint64_t> prefix_ints;   // 7e84 帧首记录的 SeqA/SeqB
+};
 
-// 把原始 TickRecord 映射到业务字段。返回 false 表示记录无效 (phantom / 截断), 此时不会触动
-// BusinessState (调用方应该把这条记录当不存在, 不要计入下一条的 +1)。
-inline bool decodeBusiness(const TickRecord& rec, BusinessState& st, TickBusiness& out) {
-    out = TickBusiness{};
-    out.security_id = rec.security_id;
-    out.bs_flag     = rec.bs_flag;
-    out.ext_code    = rec.ext_code;
-    out.type        = rec.action;
+// PMAP 驱动的顺序解析器
+class TickStreamParser {
+public:
+    TickStreamParser(const uint8_t* body, size_t len)
+        : body_(body), len_(len) {}
 
-    // Action 继承 (wire 里没有 Action 字节) 时, TickTime 可能会流入 middle_ints 的前端。
-    // 按 Action 模板期望数量反推: 超出的前 k 个中间 int 其实是前导字段。
-    std::vector<uint64_t> prefix_ints = rec.prefix_ints;
-    std::vector<uint64_t> middle_ints(rec.ints.begin(), rec.ints.end());
-    if (!rec.has_action && rec.action) {
-        size_t want = expectedMiddleCount(rec.action, middle_ints.size());
-        while (want > 0 && middle_ints.size() > want) {
-            prefix_ints.push_back(middle_ints.front());
-            middle_ints.erase(middle_ints.begin());
+    // 读取下一条记录，返回 false 表示 body 耗尽或解析失败
+    bool next(TickRecord& rec) {
+        rec = TickRecord{};
+
+        if (cursor_ >= len_) return false;
+
+        // 读 PMAP
+        uint16_t bits = 0;
+        size_t   pm_len = 0;
+        if (!readPmap(body_ + cursor_, len_ - cursor_, bits, pm_len)) return false;
+        cursor_ += pm_len;
+        rec.pmap_raw = bits;
+
+        auto consume = [&](size_t n) -> bool {
+            if (cursor_ + n > len_) return false;
+            cursor_ += n;
+            return true;
+        };
+        auto readFastHere = [&](uint64_t& out) -> bool {
+            auto [v, w] = readFast(body_ + cursor_, len_ - cursor_);
+            if (w == 0) return false;
+            out = v; cursor_ += w;
+            return true;
+        };
+
+        // bit 0: TID
+        if (bits & (1 << 0)) {
+            if (cursor_ + 2 > len_) return false;
+            if (body_[cursor_] != 0x2d || body_[cursor_ + 1] != 0xab) return false;
+            cursor_ += 2;
+            rec.template_id = 5803;
         }
-    }
 
-    // 先做合法性检查: Action 和 MiddleInts 数量必须匹配模板, 否则直接返回 false
-    // 不要先改 st 再失败, 否则会串到下一条记录。
-    auto want_middle = [&]() -> size_t {
-        switch (rec.action) {
-            case 'A': return (middle_ints.size() >= 4) ? 4 : 3;
-            case 'D':
-            case 'C': return 3;
-            case 'T': return 5;
-            default:  return 0;
-        }
-    };
-    size_t want = want_middle();
-    if (want == 0 || middle_ints.size() < want) return false;
-
-    // --- 继承 / 帧级前导字段 ---
-    // 线缆字段顺序: (BizIndex, Channel, TickTime) 三个字段各占 PMAP 一位。
-    // 实测本通道的出现组合只有 {∅, {TickTime}, {三者全}}, 没观察到单独 Channel。
-    // 推断 PMAP 位逻辑: 三位各自控制一个字段是否显式出现, 省略则按操作符继承:
-    //   BizIndex  (mandatory + increment): 省略 → 上条 +1
-    //   Channel   (mandatory + Copy      ): 省略 → 继承上条
-    //   TickTime  (nullable  + Copy      ): 省略 → 继承上条; 显式出现还要 -1 (nullable)
-    // 按 prefix_ints 条数分派 (n=2 情况尚未实测, 暂按 [Channel, TickTime] 处理):
-    size_t n = prefix_ints.size();
-    auto applyTickTime = [&](uint64_t enc) {
-        auto [t, is_null] = decNull(enc);
-        if (!is_null) {
-            out.tick_time = uint32_t(t);
-            st.last_tick_time = out.tick_time;
+        // bit 1: BizIndex
+        if (bits & (1 << 1)) {
+            uint64_t v = 0;
+            if (!readFastHere(v)) return false;
+            last_biz_index_ = v;
         } else {
-            out.tick_time = st.last_tick_time;
+            ++last_biz_index_;
         }
-    };
-    switch (n) {
-        case 3:
-            out.biz_index = prefix_ints[0];
-            out.channel   = uint32_t(prefix_ints[1]);
-            st.last_biz_index = out.biz_index;
-            st.last_channel   = out.channel;
-            applyTickTime(prefix_ints[2]);
-            break;
-        case 2:
-            out.biz_index = ++st.last_biz_index;
-            out.channel   = uint32_t(prefix_ints[0]);
-            st.last_channel = out.channel;
-            applyTickTime(prefix_ints[1]);
-            break;
-        case 1:
-            out.biz_index = ++st.last_biz_index;
-            out.channel   = st.last_channel;
-            applyTickTime(prefix_ints[0]);
-            break;
-        default:
-            out.biz_index = ++st.last_biz_index;
-            out.channel   = st.last_channel;
-            out.tick_time = st.last_tick_time;
-            break;
+        rec.biz_index = last_biz_index_;
+
+        // bit 2: Channel
+        if (bits & (1 << 2)) {
+            uint64_t v = 0;
+            if (!readFastHere(v)) return false;
+            last_channel_ = uint32_t(v);
+        }
+        rec.channel = last_channel_;
+
+        // bit 3: SecurityID
+        if (bits & (1 << 3)) {
+            std::string sid;
+            if (!tryReadAsciiSecID(body_ + cursor_, len_ - cursor_, sid)) return false;
+            cursor_ += 6;
+            last_sec_id_ = sid;
+        }
+        rec.security_id = last_sec_id_;
+
+        // bit 4: TickTime (nullable)
+        if (bits & (1 << 4)) {
+            uint64_t v = 0;
+            if (!readFastHere(v)) return false;
+            auto [t, is_null] = decNull(v);
+            last_tick_time_ = is_null ? last_tick_time_ : uint32_t(t);
+        }
+        rec.tick_time = last_tick_time_;
+
+        // bit 5: Action
+        if (bits & (1 << 5)) {
+            if (cursor_ >= len_) return false;
+            uint8_t b = body_[cursor_++];
+            char c = char(b & 0x7F);
+            if (c != 'A' && c != 'D' && c != 'T' && c != 'C') {
+                // 不是 trade action，可能是 Type='S' 记录
+                // 退回，改走状态记录路径
+                --cursor_;
+                return parseStatusRecord(rec, bits);
+            }
+            last_action_ = c;
+        }
+        rec.action = last_action_;
+
+        // 检测 Type='S'：bit5=0 且 bits 6-10 都为 0 且 bit11=1
+        bool no_middle = !(bits & 0x07C0);  // bits 6-10 全 0
+        bool has_bs    =  (bits & (1 << 11));
+        if (!rec.action && no_middle && has_bs) {
+            return parseStatusRecord(rec, bits);
+        }
+
+        // bit 6: BuyOrderNO (nullable)
+        if (bits & (1 << 6)) {
+            uint64_t v = 0;
+            if (!readFastHere(v)) return false;
+            auto [x, is_null] = decNull(v);
+            rec.buy_order_no = is_null ? 0 : x;
+        }
+
+        // bit 7: SellOrderNO (nullable)
+        if (bits & (1 << 7)) {
+            uint64_t v = 0;
+            if (!readFastHere(v)) return false;
+            auto [x, is_null] = decNull(v);
+            rec.sell_order_no = is_null ? 0 : x;
+        }
+
+        // bit 8: Price (nullable)
+        if (bits & (1 << 8)) {
+            uint64_t v = 0;
+            if (!readFastHere(v)) return false;
+            auto [x, is_null] = decNull(v);
+            rec.price_e3 = is_null ? 0 : int64_t(x);
+        }
+
+        // bit 9: Qty (nullable)
+        if (bits & (1 << 9)) {
+            uint64_t v = 0;
+            if (!readFastHere(v)) return false;
+            auto [x, is_null] = decNull(v);
+            rec.qty_e3 = is_null ? 0 : int64_t(x);
+        }
+
+        // bit 10: TradeMoney (nullable)
+        if (bits & (1 << 10)) {
+            uint64_t v = 0;
+            if (!readFastHere(v)) return false;
+            auto [x, is_null] = decNull(v);
+            // 'A'/'D'/'C' 的 money 是 ×10^3，统一转为 ×10^5
+            if (rec.action == 'T') {
+                rec.money_e5 = is_null ? 0 : int64_t(x);
+            } else {
+                rec.money_e5 = is_null ? 0 : int64_t(x) * 100;
+            }
+        }
+
+        // bit 11: BSFlag
+        if (bits & (1 << 11)) {
+            if (cursor_ >= len_) return false;
+            uint8_t b = body_[cursor_++];
+            char c = char(b & 0x7F);
+            last_bs_flag_ = c;
+        }
+        rec.bs_flag = last_bs_flag_;
+
+        rec.valid = true;
+        return true;
     }
 
-    // --- 业务字段 ---
-    const auto& m = middle_ints;
-    auto getN = [&](size_t idx) -> uint64_t {
-        if (idx >= m.size()) return 0;
-        auto [v, is_null] = decNull(m[idx]);
-        return is_null ? 0 : v;
-    };
+private:
+    const uint8_t* body_;
+    size_t         len_;
+    size_t         cursor_ = 0;
 
-    switch (rec.action) {
-        case 'A':
-        case 'D':
-        case 'C': {
-            uint64_t order_no = getN(0);
-            out.price_e3 = int64_t(getN(1));
-            out.qty_e3   = int64_t(getN(2));
-            if (want >= 4) out.money_e5 = int64_t(getN(3)) * 100;  // ×10^3 → ×10^5 对齐
-            if (rec.bs_flag == 'B') out.buy_order_no = order_no;
-            else                    out.sell_order_no = order_no;
-            break;
+    uint64_t    last_biz_index_ = 0;
+    uint32_t    last_channel_   = 0;
+    std::string last_sec_id_;
+    uint32_t    last_tick_time_ = 0;
+    char        last_action_    = 0;
+    char        last_bs_flag_   = 0;
+
+    // Type='S' 状态记录解析（PMAP `48 84` / `4c 84` / `7e 84`）
+    bool parseStatusRecord(TickRecord& rec, uint16_t bits) {
+        rec.is_status_record = true;
+        rec.valid            = true;
+
+        // bit 4: TransactTime（状态记录中有时出现）
+        if (bits & (1 << 4)) {
+            uint64_t v = 0;
+            auto [val, w] = readFast(body_ + cursor_, len_ - cursor_);
+            if (w == 0) return false;
+            cursor_ += w;
+            // 不更新 last_tick_time_，状态记录时间独立
+            rec.tick_time = uint32_t(val);
         }
-        case 'T': {
-            out.buy_order_no  = getN(0);
-            out.sell_order_no = getN(1);
-            out.price_e3      = int64_t(getN(2));
-            out.qty_e3        = int64_t(getN(3));
-            out.money_e5      = int64_t(getN(4));
-            break;
+
+        // bit 11: TradingPhaseCode（FAST ASCII 变长整数）
+        if (bits & (1 << 11)) {
+            uint64_t v = 0;
+            auto [val, w] = readFast(body_ + cursor_, len_ - cursor_);
+            if (w == 0) return false;
+            cursor_ += w;
+            // 把 FAST int 反向提取为 ASCII
+            std::string phase = fastIntToAscii(val);
+            rec.security_id = last_sec_id_;
+            // 把 phase 存在 bs_flag 位置没有合适字段，用 action='S' 标记
+            rec.action = 'S';
+            // 把 trading phase 编码进 buy_order_no 当临时存储（供 engine 读取）
+            // 实际上 engine 会检查 is_status_record 并走单独的输出路径
+            (void)phase;
         }
-        default:
-            return false;
+
+        return true;
     }
-    out.valid = true;
-    return true;
-}
+};
 
-// 格式化辅助
+// ---- Type='S' 状态记录 emit 支持 ----
+// 判断一个已解析为 is_status_record 的 TickRecord 并重新解析状态字段
+// 注：由于状态记录的字段语义和 trade 不同，engine 需要重新解析对应的 raw bytes。
+// 简化做法：engine 直接检查 is_status_record，跳过 trade 输出，走状态输出路径。
+
+// ---- 格式化辅助 ----
+
 inline std::string fmtDecFixed(int64_t v, int digits) {
-    // v 是整数形式的 "×10^digits" 定点数, 输出 "X.XXX" (三位小数) 或 "X.XXXXX" (五位)
     if (digits <= 0) {
         char b[32];
         std::snprintf(b, sizeof(b), "%lld", (long long)v);
@@ -520,7 +347,6 @@ inline std::string fmtDecFixed(int64_t v, int digits) {
 }
 
 inline std::string fmtTickTime(uint32_t t) {
-    // HHMMSSXX (XX=百分之一秒) → "HH:MM:SS.XX"
     uint32_t xx = t % 100;
     uint32_t ss = (t / 100) % 100;
     uint32_t mm = (t / 10000) % 100;

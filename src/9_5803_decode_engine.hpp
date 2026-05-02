@@ -2,8 +2,6 @@
 // 9_5803_decode_engine.hpp — 解码引擎 (非 main 共享逻辑)
 //
 // 同时被 decode_9_5803.cpp (file reader) 和 decode_9_5803_live.cpp (live reader) include。
-// 每个 TU 各拥有一份匿名 namespace 全局变量, 无链接冲突。
-//
 // 依赖: zlib, PcapPlusPlus (TcpReassembly), 9_5803_struct.hpp
 
 #include <cstdint>
@@ -66,10 +64,8 @@ bool rawInflateZipLFH(const uint8_t* body, size_t n, std::vector<uint8_t>& out) 
 // ---- 输出格式 ----
 
 enum class OutMode { Human, BizCsv, RawCsv };
-OutMode  g_mode = OutMode::Human;
-
-sse95803::BusinessState* g_cur_state = nullptr;
-bool                     g_done      = false;
+OutMode g_mode = OutMode::Human;
+bool    g_done = false;
 
 // 跨 TCP 流去重: key = (channel << 32) | uint32_t(biz_index)
 std::unordered_set<uint64_t> g_seen_biz;
@@ -80,183 +76,135 @@ void printBizCsvHeaderOnce() {
     done = true;
     std::cout << "BizIndex,Channel,SecurityID,TickTime,Type,"
                  "BuyOrderNO,SellOrderNO,Price,Qty,TradeMoney,"
-                 "TickBSFlag,ExtCode,OuterSeq,FrameIdx,RecLen\n";
+                 "TickBSFlag,OuterSeq,FrameIdx,RecLen\n";
 }
 
 void printRawCsvHeaderOnce() {
     static bool done = false;
     if (done) return;
     done = true;
-    std::cout << "RecIdx,OuterSeq,FrameIdx,PMAP,TID,SecID,SecIDInherited,"
-                 "Action,ActionInherited,PrefixInts,MiddleInts,"
-                 "BSFlag,ExtCodeHex,ExtCodeAscii,RecLen\n";
-}
-
-std::string joinIntsWithWidths(const std::vector<uint64_t>& ints,
-                                const std::vector<size_t>& widths) {
-    std::ostringstream ss;
-    for (size_t i = 0; i < ints.size(); ++i) {
-        if (i) ss << '|';
-        ss << ints[i] << ':' << widths[i] << 'B';
-    }
-    return ss.str();
+    std::cout << "RecIdx,OuterSeq,FrameIdx,PMAP,"
+                 "BizIndex,Channel,SecID,TickTime,Action,"
+                 "BuyOrderNO,SellOrderNO,Price,Qty,TradeMoney,BSFlag\n";
 }
 
 void emitRaw(const sse95803::TickRecord& r, uint32_t outer_seq,
              uint32_t frame_idx, size_t rec_idx) {
     printRawCsvHeaderOnce();
-    char ext_ch = (r.ext_code >= 32 && r.ext_code < 127)
-                      ? char(r.ext_code) : '.';
     std::cout << rec_idx << ','
               << outer_seq << ','
               << frame_idx << ','
-              << "0x" << std::hex << std::setw(2) << std::setfill('0')
-              << unsigned(r.pmap) << std::dec << std::setfill(' ') << ','
-              << r.template_id << ','
+              << "0x" << std::hex << std::setw(4) << std::setfill('0')
+              << r.pmap_raw << std::dec << std::setfill(' ') << ','
+              << r.biz_index << ','
+              << r.channel << ','
               << r.security_id << ','
-              << (r.has_security_id ? 1 : 0) << ','
+              << sse95803::fmtTickTime(r.tick_time) << ','
               << (r.action ? r.action : '?') << ','
-              << (r.has_action ? 1 : 0) << ','
-              << joinIntsWithWidths(r.prefix_ints, r.prefix_widths) << ','
-              << joinIntsWithWidths(r.ints, r.widths) << ','
-              << (r.bs_flag ? r.bs_flag : '?') << ','
-              << "0x" << std::hex << std::setw(2) << std::setfill('0')
-              << unsigned(r.ext_code) << std::dec << std::setfill(' ') << ','
-              << ext_ch << ','
-              << r.raw_len << '\n';
+              << r.buy_order_no << ','
+              << r.sell_order_no << ','
+              << sse95803::fmtDecFixed(r.price_e3, 3) << ','
+              << sse95803::fmtDecFixed(r.qty_e3, 3) << ','
+              << sse95803::fmtDecFixed(r.money_e5, 5) << ','
+              << (r.bs_flag ? r.bs_flag : '?') << '\n';
 }
 
 void emitBiz(const sse95803::TickRecord& r, uint32_t outer_seq,
              uint32_t frame_idx) {
     printBizCsvHeaderOnce();
-    sse95803::TickBusiness b;
-    if (!sse95803::decodeBusiness(r, *g_cur_state, b)) {
-        std::cout << "?," << g_cur_state->last_channel << ',' << r.security_id
+    if (!r.valid) {
+        std::cout << "?," << r.channel << ',' << r.security_id
                   << ",?," << (r.action ? r.action : '?')
                   << ",?,?,?,?,?," << (r.bs_flag ? r.bs_flag : '?')
-                  << ",0x" << std::hex << std::setw(2) << std::setfill('0')
-                  << unsigned(r.ext_code) << std::dec << std::setfill(' ')
-                  << ',' << outer_seq << ',' << frame_idx << ',' << r.raw_len
-                  << '\n';
+                  << ',' << outer_seq << ',' << frame_idx << ",0\n";
         return;
     }
 
-    uint64_t key = (uint64_t(b.channel) << 32) | uint32_t(b.biz_index);
+    uint64_t key = (uint64_t(r.channel) << 32) | uint32_t(r.biz_index);
     if (!g_seen_biz.insert(key).second) return;
 
-    char ext_ch = (b.ext_code >= 32 && b.ext_code < 127)
-                      ? char(b.ext_code) : '.';
-    std::cout << b.biz_index << ','
-              << b.channel << ','
-              << b.security_id << ','
-              << sse95803::fmtTickTime(b.tick_time) << ','
-              << b.type << ','
-              << b.buy_order_no << ','
-              << b.sell_order_no << ','
-              << sse95803::fmtDecFixed(b.price_e3, 3) << ','
-              << sse95803::fmtDecFixed(b.qty_e3, 3) << ','
-              << sse95803::fmtDecFixed(b.money_e5, 5) << ','
-              << b.bs_flag << ','
-              << ext_ch << ','
-              << outer_seq << ',' << frame_idx << ',' << r.raw_len << '\n';
+    std::cout << r.biz_index << ','
+              << r.channel << ','
+              << r.security_id << ','
+              << sse95803::fmtTickTime(r.tick_time) << ','
+              << r.action << ','
+              << r.buy_order_no << ','
+              << r.sell_order_no << ','
+              << sse95803::fmtDecFixed(r.price_e3, 3) << ','
+              << sse95803::fmtDecFixed(r.qty_e3, 3) << ','
+              << sse95803::fmtDecFixed(r.money_e5, 5) << ','
+              << r.bs_flag << ','
+              << outer_seq << ',' << frame_idx << ",0\n";
 }
 
 void emitHuman(const sse95803::TickRecord& r, uint32_t outer_seq,
                const std::string& stream_tag, uint32_t frame_idx,
                size_t rec_idx) {
-    sse95803::TickBusiness b;
-    sse95803::decodeBusiness(r, *g_cur_state, b);
-
-    uint64_t key = (uint64_t(b.channel) << 32) | uint32_t(b.biz_index);
+    uint64_t key = (uint64_t(r.channel) << 32) | uint32_t(r.biz_index);
     if (!g_seen_biz.insert(key).second) return;
 
     std::cout << "\n[tick] " << stream_tag
               << "  frame#" << frame_idx << "  rec#" << rec_idx
-              << "  outer_seq=" << outer_seq
-              << "  len=" << r.raw_len << "\n"
-              << "  PMAP=0x" << std::hex << std::setw(2) << std::setfill('0')
-              << unsigned(r.pmap) << std::dec << std::setfill(' ')
+              << "  outer_seq=" << outer_seq << "\n"
+              << "  PMAP=0x" << std::hex << std::setw(4) << std::setfill('0')
+              << r.pmap_raw << std::dec << std::setfill(' ')
               << "  TID=" << r.template_id << "\n"
-              << "  BizIndex   = " << b.biz_index << "\n"
-              << "  Channel    = " << b.channel << "\n"
-              << "  SecurityID = " << b.security_id
-              << (r.has_security_id ? "" : " (继承)") << "\n"
-              << "  TickTime   = " << sse95803::fmtTickTime(b.tick_time)
-              << " (" << b.tick_time << ")\n"
-              << "  Type       = " << (b.type ? b.type : '?')
-              << (r.has_action ? "" : " (继承)") << "\n"
-              << "  BuyOrderNO = " << b.buy_order_no << "\n"
-              << "  SellOrderNO= " << b.sell_order_no << "\n"
-              << "  Price      = " << sse95803::fmtDecFixed(b.price_e3, 3) << "\n"
-              << "  Qty        = " << sse95803::fmtDecFixed(b.qty_e3, 3) << "\n"
-              << "  TradeMoney = " << sse95803::fmtDecFixed(b.money_e5, 5) << "\n"
-              << "  BSFlag     = " << (b.bs_flag ? b.bs_flag : '?') << "\n"
-              << "  ExtCode    = 0x" << std::hex << std::setw(2) << std::setfill('0')
-              << unsigned(b.ext_code) << std::dec << std::setfill(' ') << " ('"
-              << char(b.ext_code >= 32 && b.ext_code < 127 ? b.ext_code : '.')
-              << "')\n";
-    if (!b.valid) {
-        std::cout << "  [WARN] 解码失败: MiddleInts 数量与 Action 模板不符\n"
-                  << "    PrefixInts = " << joinIntsWithWidths(r.prefix_ints, r.prefix_widths) << "\n"
-                  << "    MiddleInts = " << joinIntsWithWidths(r.ints, r.widths) << "\n";
+              << "  BizIndex   = " << r.biz_index << "\n"
+              << "  Channel    = " << r.channel << "\n"
+              << "  SecurityID = " << r.security_id << "\n"
+              << "  TickTime   = " << sse95803::fmtTickTime(r.tick_time)
+              << " (" << r.tick_time << ")\n"
+              << "  Type       = " << (r.action ? r.action : '?') << "\n"
+              << "  BuyOrderNO = " << r.buy_order_no << "\n"
+              << "  SellOrderNO= " << r.sell_order_no << "\n"
+              << "  Price      = " << sse95803::fmtDecFixed(r.price_e3, 3) << "\n"
+              << "  Qty        = " << sse95803::fmtDecFixed(r.qty_e3, 3) << "\n"
+              << "  TradeMoney = " << sse95803::fmtDecFixed(r.money_e5, 5) << "\n"
+              << "  BSFlag     = " << (r.bs_flag ? r.bs_flag : '?') << "\n";
+    if (!r.valid) {
+        std::cout << "  [WARN] 解码失败\n";
     }
 }
 
-// ---- Type='S' (TradingPhaseCode) 状态记录 emit ----
-
-void emitStatBiz(const sse95803::StatusRecord& s, uint32_t outer_seq,
+void emitStatBiz(const sse95803::TickRecord& r, uint32_t outer_seq,
                  uint32_t frame_idx) {
     printBizCsvHeaderOnce();
-    std::string tt = s.has_transact_time
-                         ? sse95803::fmtTickTime(s.transact_time)
-                         : "";
-    // Type='S' 的 FAST 报文中没有 BizIndex/Channel/价量字段, 统一留空
-    std::cout << ','                  // BizIndex (FAST 中不存在)
-              << ','                  // Channel  (FAST 中不存在)
-              << s.security_id << ','
+    std::string tt = r.tick_time ? sse95803::fmtTickTime(r.tick_time) : "";
+    std::cout << ','                 // BizIndex
+              << ','                 // Channel
+              << r.security_id << ','
               << tt << ','
               << 'S' << ','
-              << ",,,,,"              // BuyNO,SellNO,Price,Qty,Money (不适用)
-              << s.trading_phase << ','
-              << ','                  // ExtCode  (不适用)
-              << outer_seq << ',' << frame_idx << ',' << 0 << '\n';
+              << ",,,,,"             // BuyNO,SellNO,Price,Qty,Money
+              << ','                 // BSFlag（状态记录没有）
+              << outer_seq << ',' << frame_idx << ",0\n";
 }
 
-void emitStatHuman(const sse95803::StatusRecord& s, uint32_t outer_seq,
+void emitStatHuman(const sse95803::TickRecord& r, uint32_t outer_seq,
                    const std::string& stream_tag, uint32_t frame_idx) {
     std::cout << "\n[stat] " << stream_tag
               << "  frame#" << frame_idx
               << "  outer_seq=" << outer_seq << "\n"
-              << "  SecurityID     = " << s.security_id << "\n"
-              << "  TradingPhase   = " << s.trading_phase << "\n";
-    if (s.has_transact_time)
-        std::cout << "  TransactTime   = " << sse95803::fmtTickTime(s.transact_time)
-                  << " (" << s.transact_time << ")\n";
-    if (!s.prefix_ints.empty()) {
-        std::cout << "  FrameSeq       =";
-        for (auto v : s.prefix_ints) std::cout << ' ' << v;
-        std::cout << '\n';
-    }
+              << "  SecurityID = " << r.security_id << "\n";
+    if (r.tick_time)
+        std::cout << "  TransactTime = " << sse95803::fmtTickTime(r.tick_time)
+                  << " (" << r.tick_time << ")\n";
 }
 
 void emitRecord(const sse95803::TickRecord& r, uint32_t outer_seq,
                 const std::string& stream_tag, uint32_t frame_idx,
                 size_t rec_idx) {
-    // action==0 → 尝试解析为 Type='S' 状态记录
-    if (r.action == 0) {
-        sse95803::StatusRecord sr;
-        if (sse95803::decodeStat(r, sr)) {
-            switch (g_mode) {
-                case OutMode::BizCsv: emitStatBiz(sr, outer_seq, frame_idx);              break;
-                case OutMode::Human:  emitStatHuman(sr, outer_seq, stream_tag, frame_idx); break;
-                case OutMode::RawCsv: emitRaw(r, outer_seq, frame_idx, rec_idx);          break;
-            }
-            return;
+    if (r.is_status_record) {
+        switch (g_mode) {
+            case OutMode::BizCsv: emitStatBiz(r, outer_seq, frame_idx);               break;
+            case OutMode::Human:  emitStatHuman(r, outer_seq, stream_tag, frame_idx); break;
+            case OutMode::RawCsv: emitRaw(r, outer_seq, frame_idx, rec_idx);          break;
         }
+        return;
     }
     switch (g_mode) {
-        case OutMode::BizCsv: emitBiz(r, outer_seq, frame_idx); break;
-        case OutMode::RawCsv: emitRaw(r, outer_seq, frame_idx, rec_idx); break;
+        case OutMode::BizCsv: emitBiz(r, outer_seq, frame_idx);                    break;
+        case OutMode::RawCsv: emitRaw(r, outer_seq, frame_idx, rec_idx);           break;
         case OutMode::Human:  emitHuman(r, outer_seq, stream_tag, frame_idx, rec_idx); break;
     }
 }
@@ -285,10 +233,10 @@ void decodeFrame(const uint8_t* frame_head, size_t frame_len,
 
     sse95803::TickStreamParser parser(payload, plen);
     sse95803::TickRecord       rec;
-    for (size_t i = 0; i < parser.record_count(); ++i) {
-        if (!parser.parse(i, rec)) continue;
-        if (rec.template_id != kWantLo) continue;
-        emitRecord(rec, outer_seq, stream_tag, frame_idx, i);
+    size_t rec_idx = 0;
+    while (parser.next(rec)) {
+        if (rec.template_id != kWantLo && !rec.is_status_record) continue;
+        emitRecord(rec, outer_seq, stream_tag, frame_idx, rec_idx++);
     }
 }
 
@@ -298,7 +246,6 @@ class Splitter {
 public:
     size_t      max_frames = 0;
     std::string stream_tag;
-    sse95803::BusinessState biz_state;
 
     void feed(const uint8_t* data, size_t len) {
         buf_.insert(buf_.end(), data, data + len);
@@ -349,9 +296,7 @@ private:
         ++frame_idx_;
         if (max_frames > 0 && printed_ >= max_frames) { g_done = true; return; }
         ++printed_;
-        g_cur_state = &biz_state;
         decodeFrame(f, length, stream_tag, frame_idx_);
-        g_cur_state = nullptr;
     }
 };
 
@@ -392,11 +337,9 @@ void onConnEnd(const pcpp::ConnectionData& c,
     ctx->streams.erase(c.flowKey);
 }
 
-// ---- 命令行参数解析 (file 和 live 共用部分) ----
-
 void parseCommonArgs(int argc, char** argv, int start,
                      uint16_t& filter_port, OutMode& mode) {
-    filter_port = (argc > start)     ? uint16_t(std::stoi(argv[start])) : 5261;
+    filter_port = (argc > start) ? uint16_t(std::stoi(argv[start])) : 5261;
     for (int i = start + 1; i < argc; ++i) {
         std::string a = argv[i];
         if      (a == "--csv")     mode = OutMode::BizCsv;
