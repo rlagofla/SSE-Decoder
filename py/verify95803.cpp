@@ -1,12 +1,15 @@
+// error 第一行是 decode 的，第二行是 ref
+// miss cnt 是 decode 的在 ref 中找不到
+// error cnt 是 decode 的在 ref 中找到了，但是后面对不上
+// match cnt 是 decode 找到了也对上了
+// ref remain 是 ref 中 没有被匹配到的，包括 error
+
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
-#include <fstream>
-#include <iomanip>
 #include <iostream>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "csv.hpp"
@@ -43,25 +46,28 @@ struct TickRecord {
     inline uint64_t get_key() const {
         return (uint64_t(this->channel) << 32) | uint32_t(this->biz_index);
     }
-    
-    inline void print() {
-        std::cout << this->biz_index   << "\t"
-                  << this->channel     << "\t"
-                  << this->security_id << "\t"
-                  << this->type        << "\t"
-                  << this->price       << "\t"
-                  << this->qty         << "\t"
-                  << this->money       << "\t";
+
+    inline void print() const {
+        std::cout << this->biz_index    << "\t"
+                  << this->channel      << "\t"
+                  << this->security_id  << "\t"
+                  << this->type         << "\t"
+                  << this->buy_order_no << "\t"
+                  << this->sell_order_no << "\t"
+                  << this->price        << "\t"
+                  << this->qty          << "\t"
+                  << this->money        << "\n";
     }
 
     inline static bool isSame(const TickRecord& a, const TickRecord& b) {
-        return a.security_id == b.security_id && 
-                      a.type == b.type        && 
-                     a.price == b.price       && 
-                       a.qty == b.qty         && 
-                     a.money == b.money       &&
-                   a.bs_flag == b.bs_flag     &&
-                   a.buy_order_no == b.buy_order_no && a.sell_order_no == b.sell_order_no;
+        return a.security_id   == b.security_id  &&
+               a.type          == b.type         &&
+               a.price         == b.price        &&
+               a.qty           == b.qty          &&
+               a.money         == b.money        &&
+               a.bs_flag       == b.bs_flag      &&
+               a.buy_order_no  == b.buy_order_no &&
+               a.sell_order_no == b.sell_order_no;
     }
 };
 
@@ -71,35 +77,37 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    auto dec = read_csv<TickRecord>(argv[1]);
-    auto ref = read_csv<TickRecord>(argv[1]);
-
-    std::unordered_map<uint64_t, TickRecord*> ref_set;
-    for(auto &i : ref) {
-        ref_set[i.get_key()] = &i;
-    }
+    std::unordered_map<uint64_t, TickRecord> ref_set;
+    size_t ref_n = foreach_csv<TickRecord>(argv[2], [&](const TickRecord& record) {
+        ref_set[record.get_key()] = record;
+    });
 
     size_t miss_cnt = 0;
     size_t error_cnt = 0;
     size_t match_cnt = 0;
-    for(auto &i : dec) {
-        auto it = ref_set.find(i.get_key());
-        if(it == ref_set.end()) {
+
+    size_t dec_n = foreach_csv<TickRecord>(argv[1], [&](const TickRecord& record) {
+        auto it = ref_set.find(record.get_key());
+        if (it == ref_set.end()) {
             std::cout << " miss: ";
-            i.print();
+            record.print();
             ++miss_cnt;
-            continue;
+            return;
         }
-        if(TickRecord::isSame(i, *(it->second))) {
+        if (TickRecord::isSame(record, it->second)) {
             ++match_cnt;
             ref_set.erase(it);
-            continue;
+            return;
         }
         std::cout << "error: ";
-        i.print();
+        record.print();
+        std::cout << "       ";
+        it->second.print();
         ++error_cnt;
-    }
-    printf(" dec size: %ld\n ref size: %ld\n miss_cnt: %ld\nerror_cnt: %ld\nmatch_cnt: %ld\n", dec.size(), ref.size(), miss_cnt, error_cnt, match_cnt);
+    });
+
+    printf(" dec size: %ld\n ref size: %ld\n miss_cnt: %ld\nerror_cnt: %ld\nmatch_cnt: %ld\nref remain %ld",
+           dec_n, ref_n, miss_cnt, error_cnt, match_cnt, ref_set.size());
 
     return 0;
 }

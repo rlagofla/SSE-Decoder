@@ -1,5 +1,6 @@
 #pragma once
 #include <fstream>
+#include <iostream>
 #include <sstream>
 #include <vector>
 #include <string>
@@ -23,12 +24,33 @@ std::vector<std::string> split_csv_line(const std::string& line) {
     return fields;
 }
 
+template<typename T, typename F>
+size_t foreach_csv(const std::string& filename, F&& fn) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        throw std::runtime_error("Cannot open file: " + filename);
+    }
+    std::cout << "Reading " << filename << std::endl;
+
+    size_t n = 0;
+    std::string line;
+    bool first_line = true;
+    while (std::getline(file, line)) {
+        if (first_line) { first_line = false; continue; }
+        if (line.empty()) continue;
+        fn(T::from_row(split_csv_line(line)));
+        ++n;
+    }
+    return n;
+}
+
 template<typename T>
 std::vector<T> read_csv(const std::string& filename) {
     std::ifstream file(filename);
     if (!file.is_open()) {
         throw std::runtime_error("Cannot open file: " + filename);
     }
+    std::cout << "Reading " + filename << std::endl;
 
     std::vector<T> result;
     std::string line;
