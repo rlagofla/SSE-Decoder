@@ -15,12 +15,15 @@
 
 #include <PcapLiveDevice.h>
 #include <PcapLiveDeviceList.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
 
 #include "9_5803_decode_engine.hpp"
 
 static std::atomic<bool> g_stop{false};
 
 int main(int argc, char** argv) {
+    spdlog::set_default_logger(spdlog::stderr_color_mt("console"));
+
     if (argc < 2) {
         std::cerr << "用法: " << argv[0]
                   << " <iface> [filter_port=5261] [--csv|--raw-csv]\n"

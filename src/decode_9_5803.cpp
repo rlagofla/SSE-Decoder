@@ -6,10 +6,13 @@
 #include <iostream>
 #include <PcapFileDevice.h>
 #include <Packet.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
 
 #include "9_5803_decode_engine.hpp"
 
 int main(int argc, char** argv) {
+    spdlog::set_default_logger(spdlog::stderr_color_mt("console"));
+
     if (argc < 2) {
         std::cerr << "用法: " << argv[0]
                   << " <pcap> [filter_port=5261] [max_frames_per_stream=0] [--csv|--raw-csv]\n"
