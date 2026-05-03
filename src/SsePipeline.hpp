@@ -235,6 +235,15 @@ public:
         }
         rec.bs_flag = last_bs_flag_;
 
+        // 非状态记录的 BSFlag 只能是 B/S/N
+        if (rec.action != 'S') {
+            if (rec.bs_flag != "B" && rec.bs_flag != "S" && rec.bs_flag != "N") {
+                spdlog::warn("[9-5803] BSFlag 非法: val={} action={} biz={}",
+                             rec.bs_flag, rec.action, rec.biz_index);
+                return false;
+            }
+        }
+
         // 成交记录：price_e3 × qty_e3 应等于 money_e5 × 10
         if (rec.action == 'T' && rec.price_e3 * rec.qty_e3 != rec.money_e5 * 10) {
             spdlog::warn("[9-5803] price×qty≠money: price={} qty={} money={} biz={}",
