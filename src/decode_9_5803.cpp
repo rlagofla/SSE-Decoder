@@ -1,9 +1,10 @@
 // decode_9_5803.cpp — 上交所 (9, 5803) 逐笔行情解码器 (pcap 文件输入)
 //
 // 用法:
-//   decode_9_5803 <pcap> [filter_port=5261] [--csv|--raw-csv]
+//   decode_9_5803 <pcap> [filter_port=5261]
 
 #include <iostream>
+#include <sstream>
 #include <PcapFileDevice.h>
 #include <Packet.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -26,6 +27,8 @@ void onConnStart(const pcpp::ConnectionData& c, void* cookie) {
         return;
     }
     auto sp = std::make_unique<Splitter>();
+    sp->want_hi = ctx->want_hi;
+    sp->want_lo = ctx->want_lo;
     std::ostringstream ss;
     ss << c.srcIP.toString() << ":" << c.srcPort
        << "->" << c.dstIP.toString() << ":" << c.dstPort;
@@ -57,35 +60,19 @@ void onConnEnd(const pcpp::ConnectionData& c,
     }
 }
 
-void parseCommonArgs(int argc, char** argv, int start,
-                     uint16_t& filter_port, OutMode& mode) {
-    filter_port = (argc > start) ? uint16_t(std::stoi(argv[start])) : 5261;
-    for (int i = start + 1; i < argc; ++i) {
-        std::string a = argv[i];
-        if      (a == "--csv")     mode = OutMode::BizCsv;
-        else if (a == "--raw-csv") mode = OutMode::RawCsv;
-    }
-}
-
 int main(int argc, char** argv) {
     // spdlog::set_level(spdlog::level::trace);
     spdlog::set_default_logger(spdlog::stderr_color_mt("console"));
 
-    if (argc < 2) {
-        std::cerr << "用法: " << argv[0]
-                  << " <pcap> [filter_port=5261] [--csv|--raw-csv]\n"
-                  << "  --csv      : 业务 CSV, 列对齐 通联 mdl_*.csv\n"
-                  << "  --raw-csv  : 原始 FAST ints, 调试用\n";
+    if (argc < 4) {
+        std::cerr << "用法: " << argv[0] << " <pcap> <hi> <lo> [filter_port=5261]\n";
         return 1;
     }
 
     Context ctx;
-    ctx.filter_port = (argc >= 3) ? uint16_t(std::stoi(argv[2])) : 5261;
-    for (int i = 4; i < argc; ++i) {
-        std::string a = argv[i];
-        if      (a == "--csv")     g_mode = OutMode::BizCsv;
-        else if (a == "--raw-csv") g_mode = OutMode::RawCsv;
-    }
+    ctx.want_hi     = uint32_t(std::stoul(argv[2]));
+    ctx.want_lo     = uint32_t(std::stoul(argv[3]));
+    ctx.filter_port = (argc >= 5) ? uint16_t(std::stoi(argv[4])) : 5261;
 
     pcpp::PcapFileReaderDevice reader(argv[1]);
     if (!reader.open()) {

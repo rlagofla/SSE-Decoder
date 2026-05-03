@@ -25,7 +25,7 @@ struct TickRecord {
     double      price      = 0;     // Price × 1000 (STEP 三位小数的整数表达)
     double      qty        = 0;     // Qty   × 1000
     double      money      = 0;     // TradeMoney × 10^5
-    char        bs_flag    = 0;     // 'B'/'S'/'N'
+    std::string bs_flag    = "";     // 'B'/'S'/'N'
 
     static TickRecord from_row(const std::vector<std::string>& fields) {
         TickRecord ans{};
@@ -39,7 +39,7 @@ struct TickRecord {
         ans.price         = from_string<double>(fields[7]);
         ans.qty           = from_string<double>(fields[8]);
         ans.money         = from_string<double>(fields[9]);
-        ans.bs_flag       = fields[10][0];
+        ans.bs_flag       = fields[10];
         return ans;
     }
 

@@ -10,7 +10,6 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
-#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -24,9 +23,7 @@
 
 namespace {
 
-constexpr uint32_t kMagic  = 0x0004C453u;
-constexpr uint32_t kWantHi = 9;
-constexpr uint32_t kWantLo = 5803;
+constexpr uint32_t kMagic = 0x0004C453u;
 
 uint32_t readBE32(const uint8_t* p) {
     return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) |
@@ -110,39 +107,23 @@ bool rawInflateZipLFH(const uint8_t* body, size_t n, std::vector<uint8_t>& out) 
 
 // ---- 输出格式 ----
 
-enum class OutMode { Human, BizCsv, RawCsv };
-OutMode g_mode = OutMode::Human;
-
 // 跨 TCP 流去重: key = (channel << 32) | uint32_t(biz_index)
 std::unordered_set<uint64_t> g_seen_biz;
 
-void printBizCsvHeaderOnce() {
-    static bool done = false;
-    if (done) return;
-    done = true;
-    std::cout << "BizIndex,Channel,SecurityID,TickTime,Type,"
-                 "BuyOrderNO,SellOrderNO,Price,Qty,TradeMoney,"
-                 "TickBSFlag,OuterSeq,FrameIdx,RecLen\n";
-}
+void emitRecord(const sse95803::TickRecord& r, uint32_t outer_seq,
+                const std::string& /*stream_tag*/, uint32_t frame_idx,
+                size_t rec_idx) {
+    uint64_t key = (uint64_t(r.channel) << 32) | uint32_t(r.biz_index);
+    if (!g_seen_biz.insert(key).second) return;
 
-void printRawCsvHeaderOnce() {
-    static bool done = false;
-    if (done) return;
-    done = true;
-    std::cout << "RecIdx,OuterSeq,FrameIdx,PMAP,"
-                 "BizIndex,Channel,SecID,TickTime,Action,"
-                 "BuyOrderNO,SellOrderNO,Price,Qty,TradeMoney,BSFlag\n";
-}
+    static bool header_done = false;
+    if (!header_done) {
+        header_done = true;
+        std::cout << "BizIndex,Channel,SecID,TickTime,Action,"
+                     "BuyOrderNO,SellOrderNO,Price,Qty,TradeMoney,BSFlag,PMAP,OuterSeq,FrameIdx,RecIdx\n";
+    }
 
-void emitRaw(const sse95803::TickRecord& r, uint32_t outer_seq,
-             uint32_t frame_idx, size_t rec_idx) {
-    printRawCsvHeaderOnce();
-    std::cout << rec_idx << ','
-              << outer_seq << ','
-              << frame_idx << ','
-              << "0x" << std::hex << std::setw(4) << std::setfill('0')
-              << r.pmap_raw << std::dec << std::setfill(' ') << ','
-              << r.biz_index << ','
+    std::cout << r.biz_index << ','
               << r.channel << ','
               << r.security_id << ','
               << sse95803::fmtTickTime(r.tick_time) << ','
@@ -152,75 +133,12 @@ void emitRaw(const sse95803::TickRecord& r, uint32_t outer_seq,
               << sse95803::fmtDecFixed(r.price_e3, 3) << ','
               << sse95803::fmtDecFixed(r.qty_e3, 3) << ','
               << sse95803::fmtDecFixed(r.money_e5, 5) << ','
-              << (r.bs_flag.empty() ? "?" : r.bs_flag) << '\n';
-}
-
-void emitBiz(const sse95803::TickRecord& r, uint32_t outer_seq,
-             uint32_t frame_idx) {
-    printBizCsvHeaderOnce();
-    if (!r.valid) {
-        std::cout << "?," << r.channel << ',' << r.security_id
-                  << ",?," << (r.action ? r.action : '?')
-                  << ",?,?,?,?,?," << (r.bs_flag.empty() ? "?" : r.bs_flag)
-                  << ',' << outer_seq << ',' << frame_idx << ",0\n";
-        return;
-    }
-
-    uint64_t key = (uint64_t(r.channel) << 32) | uint32_t(r.biz_index);
-    if (!g_seen_biz.insert(key).second) return;
-
-    std::cout << r.biz_index << ','
-              << r.channel << ','
-              << r.security_id << ','
-              << sse95803::fmtTickTime(r.tick_time) << ','
-              << r.action << ','
-              << r.buy_order_no << ','
-              << r.sell_order_no << ','
-              << sse95803::fmtDecFixed(r.price_e3, 3) << ','
-              << sse95803::fmtDecFixed(r.qty_e3, 3) << ','
-              << sse95803::fmtDecFixed(r.money_e5, 5) << ','
-              << r.bs_flag << ','
-              << outer_seq << ',' << frame_idx << ",0\n";
-}
-
-void emitHuman(const sse95803::TickRecord& r, uint32_t outer_seq,
-               const std::string& stream_tag, uint32_t frame_idx,
-               size_t rec_idx) {
-    uint64_t key = (uint64_t(r.channel) << 32) | uint32_t(r.biz_index);
-    if (!g_seen_biz.insert(key).second) return;
-
-    const char* tag = (r.action == 'S') ? "[stat]" : "[tick]";
-    std::cout << '\n' << tag << ' ' << stream_tag
-              << "  frame#" << frame_idx << "  rec#" << rec_idx
-              << "  outer_seq=" << outer_seq << "\n"
-              << "  PMAP=0x" << std::hex << std::setw(4) << std::setfill('0')
-              << r.pmap_raw << std::dec << std::setfill(' ')
-              << "  TID=" << r.template_id << "\n"
-              << "  BizIndex   = " << r.biz_index << "\n"
-              << "  Channel    = " << r.channel << "\n"
-              << "  SecurityID = " << r.security_id << "\n"
-              << "  TickTime   = " << sse95803::fmtTickTime(r.tick_time)
-              << " (" << r.tick_time << ")\n"
-              << "  Type       = " << (r.action ? r.action : '?') << "\n"
-              << "  BuyOrderNO = " << r.buy_order_no << "\n"
-              << "  SellOrderNO= " << r.sell_order_no << "\n"
-              << "  Price      = " << sse95803::fmtDecFixed(r.price_e3, 3) << "\n"
-              << "  Qty        = " << sse95803::fmtDecFixed(r.qty_e3, 3) << "\n"
-              << "  TradeMoney = " << sse95803::fmtDecFixed(r.money_e5, 5) << "\n"
-              << "  BSFlag     = " << (r.bs_flag.empty() ? "?" : r.bs_flag) << "\n";
-    if (!r.valid) {
-        std::cout << "  [WARN] 解码失败\n";
-    }
-}
-
-void emitRecord(const sse95803::TickRecord& r, uint32_t outer_seq,
-                const std::string& stream_tag, uint32_t frame_idx,
-                size_t rec_idx) {
-    switch (g_mode) {
-        case OutMode::BizCsv: emitBiz(r, outer_seq, frame_idx);                        break;
-        case OutMode::RawCsv: emitRaw(r, outer_seq, frame_idx, rec_idx);               break;
-        case OutMode::Human:  emitHuman(r, outer_seq, stream_tag, frame_idx, rec_idx); break;
-    }
+              << (r.bs_flag.empty() ? "?" : r.bs_flag) << ','
+              << "0x" << std::hex << std::setw(4) << std::setfill('0')
+              << r.pmap_raw << std::dec << std::setfill(' ') << ','
+              << outer_seq << ','
+              << frame_idx << ','
+              << rec_idx << '\n';
 }
 
 void decodeFrame(const uint8_t* frame_head, size_t frame_len,
@@ -263,6 +181,8 @@ class Splitter {
 public:
     size_t      max_frames = 0;
     std::string stream_tag;
+    uint32_t    want_hi = 0;
+    uint32_t    want_lo = 0;
 
     void feed(const uint8_t* data, size_t len) {
         buf_.insert(buf_.end(), data, data + len);
@@ -323,18 +243,27 @@ private:
     void handleFrame(const uint8_t* f, uint32_t length) {
         uint32_t hi = readBE32(f + 8);
         uint32_t lo = readBE32(f + 12);
-        if (hi != kWantHi || lo != kWantLo) {
+        if (hi != want_hi || lo != want_lo) {
             spdlog::trace("[splitter] {} 帧类型 ({},{}) 不是期望的 ({},{})，跳过 length={}",
-                          stream_tag, hi, lo, kWantHi, kWantLo, length);
+                          stream_tag, hi, lo, want_hi, want_lo, length);
             return;
         }
         ++frame_idx_;
-        decodeFrame(f, length, stream_tag, frame_idx_);
+        switch ((uint64_t(hi) << 32) | lo) {
+            case (uint64_t(9) << 32) | 5803:
+                decodeFrame(f, length, stream_tag, frame_idx_);
+                break;
+            default:
+                spdlog::warn("[splitter] {} 类型 ({},{}) 暂未实现", stream_tag, hi, lo);
+                break;
+        }
     }
 };
 
 struct Context {
     uint16_t filter_port = 5261;
+    uint32_t want_hi     = 0;
+    uint32_t want_lo     = 0;
     std::unordered_map<uint32_t, std::unique_ptr<Splitter>> streams;
 };
 
