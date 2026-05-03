@@ -61,6 +61,7 @@ struct TickRecord {
 
     inline static bool isSame(const TickRecord& a, const TickRecord& b) {
         return a.security_id   == b.security_id  &&
+               a.tick_time.substr(0, 8) == b.tick_time.substr(0, 8) &&
                a.type          == b.type         &&
                a.price         == b.price        &&
                a.qty           == b.qty          &&
