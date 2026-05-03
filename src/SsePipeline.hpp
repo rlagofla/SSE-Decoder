@@ -1,5 +1,5 @@
 #pragma once
-// 9_5803_struct.hpp — 上交所 (9, 5803) 通道逐笔行情 PMAP 驱动顺序解码
+// SsePipeline.hpp — SSE 解析管道（TickStreamParser、Splitter、Context）
 //
 // PMAP 位布局（readFast 读出的 14-bit 值，TID 在最高位 bit13）:
 //   bit13: TID          (1 = 读 2d ab)
@@ -14,39 +14,23 @@
 //   bit 4: Qty          (0 = 0,       1 = 显式 FAST u64 nullable)
 //   bit 3: TradeMoney   (0 = 0,       1 = 显式 FAST u64 nullable)
 //   bit 2: BSFlag       (0 = copy,    1 = 显式 ASCII; 'B'/'S'/'N' 或 "SUSP"/"OCALL"/"START")
-//
-// FAST nullable: 编码值 V=0 → NULL(缺省/0), V>0 → 业务值 = V-1
-// 注: 所谓 "ExtCode" 根本不存在，它是下一条记录 PMAP 的第一字节。
 
-#include <cstddef>
-#include <cstdint>
+#include <iomanip>
+#include <iostream>
+#include <memory>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include <spdlog/spdlog.h>
 
-#include "fast_utils.hpp"
+#include "SseStructs.hpp"
+#include "utils.hpp"
+
+// ---- TickStreamParser ----
 
 namespace sse95803 {
-
-// 一条解码后的记录（业务字段直接命名；action='S' 时为状态记录，bs_flag 含交易阶段码）
-struct TickRecord {
-    uint16_t    pmap_raw     = 0;  // 14-bit PMAP（调试，readFast 原始值截断）
-    uint64_t    template_id  = 0;  // 期望 5803
-
-    uint64_t    biz_index    = 0;
-    uint32_t    channel      = 0;
-    std::string security_id;
-    uint32_t    tick_time    = 0;  // HHMMSSXX，已做 nullable -1
-    char        action       = 0;  // 'A'/'D'/'T'/'C'/'S'
-    uint64_t    buy_order_no  = 0;
-    uint64_t    sell_order_no = 0;
-    int64_t     price_e3     = 0;  // Price × 1000
-    int64_t     qty_e3       = 0;  // Qty × 1000
-    int64_t     money_e5     = 0;  // TradeMoney × 10^5
-    std::string bs_flag;           // 'B'/'S'/'N' 或状态记录时 "SUSP"/"OCALL"/"START"
-
-    bool valid = false;
-};
 
 // PMAP 驱动的顺序解析器
 class TickStreamParser {
@@ -60,7 +44,6 @@ public:
 
         if (cursor_ >= len_) return false;
 
-        // 读 PMAP（与 readFast 共用 stop-bit 机制；TID 在返回值 bit13）
         uint64_t bits = 0;
         size_t   pm_len = 0;
         if (fast::readFast(body_ + cursor_, len_ - cursor_, bits, pm_len)
@@ -159,7 +142,7 @@ public:
             uint64_t v; size_t w;
             if (fast::readFast(body_ + cursor_, len_ - cursor_, v, w)
                     != fast::Status::Ok) {
-                spdlog::warn("[9-5803] BuyOrderNO: FAST 读取失败: cursor={}", cursor_);
+                spdlog::warn("[9-5803] BuyOrderNO: FAST 読取失败: cursor={}", cursor_);
                 return false;
             }
             cursor_ += w;
@@ -224,7 +207,7 @@ public:
             }
         }
 
-        // bit2: BSFlag / TradingPhaseCode (ASCII，单字节或多字节)
+        // bit2: BSFlag / TradingPhaseCode
         if (bits & (1ull << 2)) {
             std::string s; size_t w;
             if (fast::readAscii(body_ + cursor_, len_ - cursor_, s, w)
@@ -254,32 +237,171 @@ private:
     std::string last_bs_flag_;
 };
 
-// ---- 格式化辅助 ----
-
-inline std::string fmtDecFixed(int64_t v, int digits) {
-    if (digits <= 0) {
-        char b[32];
-        std::snprintf(b, sizeof(b), "%lld", (long long)v);
-        return b;
-    }
-    int64_t scale = 1;
-    for (int i = 0; i < digits; ++i) scale *= 10;
-    int64_t hi = v / scale, lo = v % scale;
-    if (lo < 0) lo = -lo;
-    char fmt[32], buf[64];
-    std::snprintf(fmt, sizeof(fmt), "%%lld.%%0%dlld", digits);
-    std::snprintf(buf, sizeof(buf), fmt, (long long)hi, (long long)lo);
-    return buf;
-}
-
-inline std::string fmtTickTime(uint32_t t) {
-    uint32_t xx = t % 100;
-    uint32_t ss = (t / 100) % 100;
-    uint32_t mm = (t / 10000) % 100;
-    uint32_t hh = t / 1000000;
-    char b[16];
-    std::snprintf(b, sizeof(b), "%02u:%02u:%02u.%02u", hh, mm, ss, xx);
-    return b;
-}
-
 }  // namespace sse95803
+
+// ---- 输出 / 解帧 / 切流 ----
+
+namespace {
+
+constexpr uint32_t kMagic = 0x0004C453u;
+
+// 跨 TCP 流去重: key = (channel << 32) | uint32_t(biz_index)
+std::unordered_set<uint64_t> g_seen_biz;
+
+void emitRecord(const sse95803::TickRecord& r, uint32_t outer_seq,
+                const std::string& /*stream_tag*/, uint32_t frame_idx,
+                size_t rec_idx) {
+    uint64_t key = (uint64_t(r.channel) << 32) | uint32_t(r.biz_index);
+    if (!g_seen_biz.insert(key).second) return;
+
+    static bool header_done = false;
+    if (!header_done) {
+        header_done = true;
+        std::cout << "BizIndex,Channel,SecID,TickTime,Action,"
+                     "BuyOrderNO,SellOrderNO,Price,Qty,TradeMoney,BSFlag,PMAP,OuterSeq,FrameIdx,RecIdx\n";
+    }
+
+    std::cout << r.biz_index << ','
+              << r.channel << ','
+              << r.security_id << ','
+              << fmtTickTime(r.tick_time) << ','
+              << (r.action ? r.action : '?') << ','
+              << r.buy_order_no << ','
+              << r.sell_order_no << ','
+              << fmtDecFixed(r.price_e3, 3) << ','
+              << fmtDecFixed(r.qty_e3, 3) << ','
+              << fmtDecFixed(r.money_e5, 5) << ','
+              << (r.bs_flag.empty() ? "?" : r.bs_flag) << ','
+              << "0x" << std::hex << std::setw(4) << std::setfill('0')
+              << r.pmap_raw << std::dec << std::setfill(' ') << ','
+              << outer_seq << ','
+              << frame_idx << ','
+              << rec_idx << '\n';
+}
+
+void onTick(const uint8_t* frame_head, size_t frame_len,
+            const std::string& stream_tag, uint32_t frame_idx) {
+    uint32_t outer_seq = readBE32(frame_head + 16);
+    uint32_t comp      = readBE32(frame_head + 32);
+    const uint8_t* body = frame_head + 40;
+    size_t         blen = frame_len - 40;
+
+    spdlog::trace("[frame] {} frame#{} outer_seq={} comp={} body_len={}",
+                  stream_tag, frame_idx, outer_seq, comp, blen);
+
+    std::vector<uint8_t> inflated;
+    const uint8_t* payload = body;
+    size_t         plen    = blen;
+
+    if (comp == 1) {
+        if (!rawInflateZipLFH(body, blen, inflated)) {
+            spdlog::warn("[frame] {} frame#{} inflate 失败，跳过 outer_seq={}",
+                         stream_tag, frame_idx, outer_seq);
+            return;
+        }
+        payload = inflated.data();
+        plen    = inflated.size();
+        spdlog::trace("[frame] {} frame#{} inflate ok: {} -> {} bytes",
+                      stream_tag, frame_idx, blen, plen);
+    }
+
+    sse95803::TickStreamParser parser(payload, plen);
+    sse95803::TickRecord       rec;
+    size_t rec_idx = 0;
+    while (parser.next(rec)) {
+        emitRecord(rec, outer_seq, stream_tag, frame_idx, rec_idx++);
+    }
+}
+
+// ---- 帧切分 ----
+
+class Splitter {
+public:
+    std::string stream_tag;
+    uint32_t    want_hi = 0;
+    uint32_t    want_lo = 0;
+
+    void feed(const uint8_t* data, size_t len) {
+        buf_.insert(buf_.end(), data, data + len);
+        drain();
+    }
+
+private:
+    std::vector<uint8_t> buf_;
+    uint32_t             frame_idx_ = 0;
+
+    void drain() {
+        while (buf_.size() >= 40) {
+            size_t idx = scanMagic();
+            if (idx == std::string::npos) {
+                spdlog::trace("[splitter] {} 未找到魔数，保留尾部 3 字节，丢弃 {} 字节",
+                              stream_tag, buf_.size() > 3 ? buf_.size() - 3 : 0u);
+                if (buf_.size() > 3) buf_.erase(buf_.begin(), buf_.end() - 3);
+                return;
+            }
+            if (idx > 0) {
+                spdlog::trace("[splitter] {} 魔数前有 {} 字节无效数据，跳过",
+                              stream_tag, idx);
+                buf_.erase(buf_.begin(), buf_.begin() + idx);
+            }
+            if (buf_.size() < 40) {
+                spdlog::trace("[splitter] {} 魔数已对齐但 header 不足 40 字节（{}），等待",
+                              stream_tag, buf_.size());
+                return;
+            }
+
+            uint32_t length = readBE32(&buf_[4]);
+            if (length < 40 || length > 16u * 1024u * 1024u) {
+                spdlog::warn("[splitter] {} 帧长度异常 length={}（期望 40~16M），跳过 4 字节继续扫描",
+                             stream_tag, length);
+                buf_.erase(buf_.begin(), buf_.begin() + 4);
+                continue;
+            }
+            if (buf_.size() < length) {
+                spdlog::trace("[splitter] {} 帧数据不完整: need={} have={}，等待",
+                              stream_tag, length, buf_.size());
+                return;
+            }
+            handleFrame(buf_.data(), length);
+            buf_.erase(buf_.begin(), buf_.begin() + length);
+        }
+    }
+
+    size_t scanMagic() const {
+        if (buf_.size() < 4) return std::string::npos;
+        size_t n = buf_.size() - 3;
+        for (size_t i = 0; i < n; ++i) {
+            if (buf_[i]     == 0x00 && buf_[i + 1] == 0x04 &&
+                buf_[i + 2] == 0xC4 && buf_[i + 3] == 0x53) return i;
+        }
+        return std::string::npos;
+    }
+
+    void handleFrame(const uint8_t* f, uint32_t length) {
+        uint32_t hi = readBE32(f + 8);
+        uint32_t lo = readBE32(f + 12);
+        if (hi != want_hi || lo != want_lo) {
+            spdlog::trace("[splitter] {} 帧类型 ({},{}) 不是期望的 ({},{})，跳过 length={}",
+                          stream_tag, hi, lo, want_hi, want_lo, length);
+            return;
+        }
+        ++frame_idx_;
+        switch ((uint64_t(hi) << 32) | lo) {
+            case (uint64_t(9) << 32) | 5803:
+                onTick(f, length, stream_tag, frame_idx_);
+                break;
+            default:
+                spdlog::warn("[splitter] {} 类型 ({},{}) 暂未实现", stream_tag, hi, lo);
+                break;
+        }
+    }
+};
+
+struct Context {
+    uint16_t filter_port = 5261;
+    uint32_t want_hi     = 0;
+    uint32_t want_lo     = 0;
+    std::unordered_map<uint32_t, std::unique_ptr<Splitter>> streams;
+};
+
+}  // namespace

@@ -1,7 +1,7 @@
-// decode_9_5803.cpp — 上交所 (9, 5803) 逐笔行情解码器 (pcap 文件输入)
+// main.cpp — 上交所 (9, 5803) 逐笔行情解码器 (pcap 文件输入)
 //
 // 用法:
-//   decode_9_5803 <pcap> [filter_port=5261]
+//   decode_9_5803 <pcap> <hi> <lo> [filter_port=5261]
 
 #include <iostream>
 #include <sstream>
@@ -9,13 +9,9 @@
 #include <Packet.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
-#include "fast_utils.hpp"
-#include "9_5803_decode_engine.hpp"
+#include "utils.hpp"
+#include "SsePipeline.hpp"
 
-
-bool portMatch(const pcpp::ConnectionData& c, uint16_t port) {
-    return port == 0 || c.srcPort == port || c.dstPort == port;
-}
 
 void onConnStart(const pcpp::ConnectionData& c, void* cookie) {
     auto* ctx = static_cast<Context*>(cookie);
