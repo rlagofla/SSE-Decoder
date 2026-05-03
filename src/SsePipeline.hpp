@@ -294,9 +294,15 @@ void onTick(const uint8_t* frame_head, size_t frame_len,
     size_t         plen    = blen;
 
     if (comp == 1) {
-        if (!rawInflateZipLFH(body, blen, inflated)) {
-            spdlog::warn("[frame] {} frame#{} inflate 失败，跳过 outer_seq={}",
-                         stream_tag, frame_idx, outer_seq);
+        auto ist = rawInflateZipLFH(body, blen, inflated);
+        if (ist != InflateStatus::Ok) {
+            static constexpr const char* kMsg[] = {
+                "Ok", "BadMagic", "BadMethod", "OffsetOverflow",
+                "SizeOverflow", "InitFailed", "DataError", "NoProgress",
+            };
+            spdlog::warn("[inflate] {} frame#{} inflate 失败({}), 跳过 outer_seq={}",
+                         stream_tag, frame_idx,
+                         kMsg[static_cast<int>(ist)], outer_seq);
             return;
         }
         payload = inflated.data();

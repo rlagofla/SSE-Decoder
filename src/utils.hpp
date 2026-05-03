@@ -10,7 +10,6 @@
 
 #include <zlib.h>
 #include <TcpReassembly.h>
-#include <spdlog/spdlog.h>
 
 // ---- FAST 协议底层 ----
 
@@ -66,41 +65,40 @@ inline uint32_t readBE32(const uint8_t* p) {
 
 // ---- inflate ----
 
-inline bool rawInflateZipLFH(const uint8_t* body, size_t n, std::vector<uint8_t>& out) {
+enum class InflateStatus {
+    Ok,
+    BadMagic,
+    BadMethod,
+    OffsetOverflow,
+    SizeOverflow,
+    InitFailed,
+    DataError,
+    NoProgress,
+};
+
+inline InflateStatus rawInflateZipLFH(const uint8_t* body, size_t n, std::vector<uint8_t>& out) {
     if (n < 30 || body[0] != 'P' || body[1] != 'K' ||
-        body[2] != 3 || body[3] != 4) {
-        spdlog::warn("[inflate] ZIP LFH 魔数校验失败: n={} head={:02x} {:02x} {:02x} {:02x}",
-                     n,
-                     n > 0 ? body[0] : 0, n > 1 ? body[1] : 0,
-                     n > 2 ? body[2] : 0, n > 3 ? body[3] : 0);
-        return false;
-    }
+        body[2] != 3 || body[3] != 4)
+        return InflateStatus::BadMagic;
 
     uint16_t method = uint16_t(body[8]) | (uint16_t(body[9]) << 8);
-    if (method != 8) {
-        spdlog::warn("[inflate] 压缩方式不是 deflate(8): method={}", method);
-        return false;
-    }
+    if (method != 8)
+        return InflateStatus::BadMethod;
 
     uint16_t name_len  = uint16_t(body[26]) | (uint16_t(body[27]) << 8);
     uint16_t extra_len = uint16_t(body[28]) | (uint16_t(body[29]) << 8);
     size_t   start     = 30u + name_len + extra_len;
-    if (start >= n) {
-        spdlog::warn("[inflate] ZIP LFH 数据区偏移超出 buffer: start={} n={}", start, n);
-        return false;
-    }
+    if (start >= n)
+        return InflateStatus::OffsetOverflow;
 
     size_t compressed_size = n - start;
-    if (compressed_size > std::numeric_limits<uInt>::max()) {
-        spdlog::warn("[inflate] 压缩数据长度超出 uInt 上限: compressed_size={}", compressed_size);
-        return false;
-    }
+    if (compressed_size > std::numeric_limits<uInt>::max())
+        return InflateStatus::SizeOverflow;
 
     z_stream zs{};
-    if (inflateInit2(&zs, -MAX_WBITS) != Z_OK) {
-        spdlog::error("[inflate] inflateInit2 失败");
-        return false;
-    }
+    if (inflateInit2(&zs, -MAX_WBITS) != Z_OK)
+        return InflateStatus::InitFailed;
+
     zs.next_in  = const_cast<Bytef*>(body + start);
     zs.avail_in = uInt(compressed_size);
 
@@ -117,24 +115,19 @@ inline bool rawInflateZipLFH(const uint8_t* body, size_t n, std::vector<uint8_t>
         ret = inflate(&zs, Z_NO_FLUSH);
 
         if (ret != Z_OK && ret != Z_STREAM_END) {
-            spdlog::warn("[inflate] inflate 返回错误: ret={} msg={} avail_in={} compressed_size={}",
-                        ret, zs.msg ? zs.msg : "(null)", zs.avail_in, compressed_size);
             inflateEnd(&zs);
-            return false;
+            return InflateStatus::DataError;
         }
-
         if (zs.avail_in == before_in && zs.avail_out == before_out) {
-            spdlog::warn("[inflate] inflate 无进展，放弃: avail_in={} avail_out={}",
-                        zs.avail_in, zs.avail_out);
             inflateEnd(&zs);
-            return false;
+            return InflateStatus::NoProgress;
         }
 
         out.insert(out.end(), buf.data(), buf.data() + (buf.size() - zs.avail_out));
     } while (ret != Z_STREAM_END);
 
     inflateEnd(&zs);
-    return ret == Z_STREAM_END;
+    return InflateStatus::Ok;
 }
 
 // ---- 格式化 ----
