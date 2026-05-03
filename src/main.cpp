@@ -93,7 +93,7 @@ int main(int argc, char** argv) {
     pcpp::TcpReassembly reassembly(onTcpData, &ctx, onConnStart, onConnEnd);
 
     if (live_mode) {
-        auto* dev = pcpp::PcapLiveDeviceList::getInstance().getDeviceByName(source);
+        auto* dev = pcpp::PcapLiveDeviceList::getInstance().getPcapLiveDeviceByName(source);
         if (!dev) {
             spdlog::error("[conn] 找不到网卡: {}", source);
             return 1;
