@@ -80,23 +80,27 @@ bool rawInflateZipLFH(const uint8_t* body, size_t n, std::vector<uint8_t>& out) 
     do {
         zs.next_out  = buf.data();
         zs.avail_out = uInt(buf.size());
+
+        uInt before_in  = zs.avail_in;
+        uInt before_out = zs.avail_out;
+
         ret = inflate(&zs, Z_NO_FLUSH);
-        if (ret == Z_MEM_ERROR) {
-            spdlog::error("[inflate] inflate 内存不足: msg={}", zs.msg ? zs.msg : "(null)");
+
+        if (ret != Z_OK && ret != Z_STREAM_END) {
+            spdlog::warn("[inflate] inflate 返回错误: ret={} msg={} avail_in={} compressed_size={}",
+                        ret, zs.msg ? zs.msg : "(null)", zs.avail_in, compressed_size);
             inflateEnd(&zs);
             return false;
         }
-        if (ret == Z_DATA_ERROR) {
-            spdlog::warn("[inflate] inflate 数据损坏: compressed_size={} msg={}",
-                         compressed_size, zs.msg ? zs.msg : "(null)");
+
+        // 无进展防御：input 和 output 都没变化 → 直接放弃
+        if (zs.avail_in == before_in && zs.avail_out == before_out) {
+            spdlog::warn("[inflate] inflate 无进展，放弃: avail_in={} avail_out={}",
+                        zs.avail_in, zs.avail_out);
             inflateEnd(&zs);
             return false;
         }
-        if (ret == Z_NEED_DICT) {
-            spdlog::warn("[inflate] inflate 需要预设字典，不支持: compressed_size={}", compressed_size);
-            inflateEnd(&zs);
-            return false;
-        }
+
         out.insert(out.end(), buf.data(), buf.data() + (buf.size() - zs.avail_out));
     } while (ret != Z_STREAM_END);
 
