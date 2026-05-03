@@ -4,6 +4,30 @@
 #include <cstdint>
 #include <string>
 
+#include "utils.hpp"
+
+// ---- 帧头（固定 40 字节，大端） ----
+
+struct FrameHeader {
+    uint32_t magic;
+    uint32_t length;
+    uint32_t type_hi;
+    uint32_t type_lo;
+    uint32_t outer_seq;
+    uint32_t comp;
+
+    static FrameHeader from(const uint8_t* p) {
+        FrameHeader h;
+        h.magic     = readBE32(p);
+        h.length    = readBE32(p +  4);
+        h.type_hi   = readBE32(p +  8);
+        h.type_lo   = readBE32(p + 12);
+        h.outer_seq = readBE32(p + 16);
+        h.comp      = readBE32(p + 32);
+        return h;
+    }
+};
+
 namespace sse95803 {
 
 // 一条解码后的记录（action='S' 时为状态记录，bs_flag 含交易阶段码）

@@ -54,6 +54,10 @@ public:
         }
         cursor_ += pm_len;
         rec.pmap_raw = uint16_t(bits);
+        if (pm_len != 2) {
+            spdlog::warn("[9-5803] PMAP 长度异常: pm_len={} cursor={}", pm_len, cursor_);
+            return false;
+        }
 
         // bit13: TID
         if (bits & (1ull << 13)) {
@@ -109,6 +113,11 @@ public:
                 return false;
             }
             cursor_ += w;
+            if (sid.size() != 6) {
+                spdlog::warn("[9-5803] SecurityID 长度异常: len={} val={} cursor={}",
+                             sid.size(), sid, cursor_);
+                return false;
+            }
             last_sec_id_ = std::move(sid);
         }
         rec.security_id = last_sec_id_;
@@ -129,11 +138,17 @@ public:
 
         // bit8: Action ('A'/'D'/'T'/'C'/'S')
         if (bits & (1ull << 8)) {
-            if (cursor_ >= len_) {
-                spdlog::warn("[9-5803] Action: buffer 已耗尽: cursor={}", cursor_);
+            std::string a; size_t w;
+            if (fast::readAscii(body_ + cursor_, len_ - cursor_, a, w) != fast::Status::Ok) {
+                spdlog::warn("[9-5803] Action: 读取失败: cursor={}", cursor_);
                 return false;
             }
-            last_action_ = char(body_[cursor_++] & 0x7F);
+            cursor_ += w;
+            if (a.size() != 1) {
+                spdlog::warn("[9-5803] Action 长度不是 1: val={} cursor={}", a, cursor_);
+                return false;
+            }
+            last_action_ = a[0];
         }
         rec.action = last_action_;
 
@@ -220,6 +235,13 @@ public:
         }
         rec.bs_flag = last_bs_flag_;
 
+        // 成交记录：price_e3 × qty_e3 应等于 money_e5 × 10
+        if (rec.action == 'T' && rec.price_e3 * rec.qty_e3 != rec.money_e5 * 10) {
+            spdlog::warn("[9-5803] price×qty≠money: price={} qty={} money={} biz={}",
+                         rec.price_e3, rec.qty_e3, rec.money_e5, rec.biz_index);
+            return false;
+        }
+
         rec.valid = true;
         return true;
     }
@@ -279,21 +301,14 @@ void emitRecord(const sse95803::TickRecord& r, uint32_t outer_seq,
               << rec_idx << '\n';
 }
 
-void onTick(const uint8_t* frame_head, size_t frame_len,
+void onTick(const uint8_t* body, size_t blen, const FrameHeader& hdr,
             const std::string& stream_tag, uint32_t frame_idx) {
-    uint32_t outer_seq = readBE32(frame_head + 16);
-    uint32_t comp      = readBE32(frame_head + 32);
-    const uint8_t* body = frame_head + 40;
-    size_t         blen = frame_len - 40;
-
     spdlog::trace("[frame] {} frame#{} outer_seq={} comp={} body_len={}",
-                  stream_tag, frame_idx, outer_seq, comp, blen);
+                  stream_tag, frame_idx, hdr.outer_seq, hdr.comp, blen);
 
     std::vector<uint8_t> inflated;
-    const uint8_t* payload = body;
-    size_t         plen    = blen;
 
-    if (comp == 1) {
+    if (hdr.comp == 1) {
         auto ist = rawInflateZipLFH(body, blen, inflated);
         if (ist != InflateStatus::Ok) {
             static constexpr const char* kMsg[] = {
@@ -302,20 +317,20 @@ void onTick(const uint8_t* frame_head, size_t frame_len,
             };
             spdlog::warn("[inflate] {} frame#{} inflate 失败({}), 跳过 outer_seq={}",
                          stream_tag, frame_idx,
-                         kMsg[static_cast<int>(ist)], outer_seq);
+                         kMsg[static_cast<int>(ist)], hdr.outer_seq);
             return;
         }
-        payload = inflated.data();
-        plen    = inflated.size();
         spdlog::trace("[frame] {} frame#{} inflate ok: {} -> {} bytes",
-                      stream_tag, frame_idx, blen, plen);
+                      stream_tag, frame_idx, blen, inflated.size());
+        body = inflated.data();
+        blen = inflated.size();
     }
 
-    sse95803::TickStreamParser parser(payload, plen);
+    sse95803::TickStreamParser parser(body, blen);
     sse95803::TickRecord       rec;
     size_t rec_idx = 0;
     while (parser.next(rec)) {
-        emitRecord(rec, outer_seq, stream_tag, frame_idx, rec_idx++);
+        emitRecord(rec, hdr.outer_seq, stream_tag, frame_idx, rec_idx++);
     }
 }
 
@@ -356,20 +371,20 @@ private:
                 return;
             }
 
-            uint32_t length = readBE32(&buf_[4]);
-            if (length < 40 || length > 16u * 1024u * 1024u) {
+            FrameHeader hdr = FrameHeader::from(buf_.data());
+            if (hdr.length < 40 || hdr.length > 16u * 1024u * 1024u) {
                 spdlog::warn("[splitter] {} 帧长度异常 length={}（期望 40~16M），跳过 4 字节继续扫描",
-                             stream_tag, length);
+                             stream_tag, hdr.length);
                 buf_.erase(buf_.begin(), buf_.begin() + 4);
                 continue;
             }
-            if (buf_.size() < length) {
+            if (buf_.size() < hdr.length) {
                 spdlog::trace("[splitter] {} 帧数据不完整: need={} have={}，等待",
-                              stream_tag, length, buf_.size());
+                              stream_tag, hdr.length, buf_.size());
                 return;
             }
-            handleFrame(buf_.data(), length);
-            buf_.erase(buf_.begin(), buf_.begin() + length);
+            handleFrame(buf_.data(), hdr);
+            buf_.erase(buf_.begin(), buf_.begin() + hdr.length);
         }
     }
 
@@ -383,21 +398,19 @@ private:
         return std::string::npos;
     }
 
-    void handleFrame(const uint8_t* f, uint32_t length) {
-        uint32_t hi = readBE32(f + 8);
-        uint32_t lo = readBE32(f + 12);
-        if (hi != want_hi || lo != want_lo) {
+    void handleFrame(const uint8_t* f, const FrameHeader& hdr) {
+        if (hdr.type_hi != want_hi || hdr.type_lo != want_lo) {
             spdlog::trace("[splitter] {} 帧类型 ({},{}) 不是期望的 ({},{})，跳过 length={}",
-                          stream_tag, hi, lo, want_hi, want_lo, length);
+                          stream_tag, hdr.type_hi, hdr.type_lo, want_hi, want_lo, hdr.length);
             return;
         }
         ++frame_idx_;
-        switch ((uint64_t(hi) << 32) | lo) {
+        switch ((uint64_t(hdr.type_hi) << 32) | hdr.type_lo) {
             case (uint64_t(9) << 32) | 5803:
-                onTick(f, length, stream_tag, frame_idx_);
+                onTick(f + 40, hdr.length - 40, hdr, stream_tag, frame_idx_);
                 break;
             default:
-                spdlog::warn("[splitter] {} 类型 ({},{}) 暂未实现", stream_tag, hi, lo);
+                spdlog::warn("[splitter] {} 类型 ({},{}) 暂未实现", stream_tag, hdr.type_hi, hdr.type_lo);
                 break;
         }
     }
