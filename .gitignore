@@ -11,6 +11,7 @@ py/CMakeLists.txt
 data/
 libs/
 .cache/
+log/
 
 CMakeLists.txt
 .DS_Store

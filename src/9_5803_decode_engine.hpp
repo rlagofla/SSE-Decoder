@@ -112,7 +112,6 @@ bool rawInflateZipLFH(const uint8_t* body, size_t n, std::vector<uint8_t>& out) 
 
 enum class OutMode { Human, BizCsv, RawCsv };
 OutMode g_mode = OutMode::Human;
-bool    g_done = false;
 
 // 跨 TCP 流去重: key = (channel << 32) | uint32_t(biz_index)
 std::unordered_set<uint64_t> g_seen_biz;
@@ -153,7 +152,7 @@ void emitRaw(const sse95803::TickRecord& r, uint32_t outer_seq,
               << sse95803::fmtDecFixed(r.price_e3, 3) << ','
               << sse95803::fmtDecFixed(r.qty_e3, 3) << ','
               << sse95803::fmtDecFixed(r.money_e5, 5) << ','
-              << (r.bs_flag ? r.bs_flag : '?') << '\n';
+              << (r.bs_flag.empty() ? "?" : r.bs_flag) << '\n';
 }
 
 void emitBiz(const sse95803::TickRecord& r, uint32_t outer_seq,
@@ -162,7 +161,7 @@ void emitBiz(const sse95803::TickRecord& r, uint32_t outer_seq,
     if (!r.valid) {
         std::cout << "?," << r.channel << ',' << r.security_id
                   << ",?," << (r.action ? r.action : '?')
-                  << ",?,?,?,?,?," << (r.bs_flag ? r.bs_flag : '?')
+                  << ",?,?,?,?,?," << (r.bs_flag.empty() ? "?" : r.bs_flag)
                   << ',' << outer_seq << ',' << frame_idx << ",0\n";
         return;
     }
@@ -190,7 +189,8 @@ void emitHuman(const sse95803::TickRecord& r, uint32_t outer_seq,
     uint64_t key = (uint64_t(r.channel) << 32) | uint32_t(r.biz_index);
     if (!g_seen_biz.insert(key).second) return;
 
-    std::cout << "\n[tick] " << stream_tag
+    const char* tag = (r.action == 'S') ? "[stat]" : "[tick]";
+    std::cout << '\n' << tag << ' ' << stream_tag
               << "  frame#" << frame_idx << "  rec#" << rec_idx
               << "  outer_seq=" << outer_seq << "\n"
               << "  PMAP=0x" << std::hex << std::setw(4) << std::setfill('0')
@@ -207,51 +207,18 @@ void emitHuman(const sse95803::TickRecord& r, uint32_t outer_seq,
               << "  Price      = " << sse95803::fmtDecFixed(r.price_e3, 3) << "\n"
               << "  Qty        = " << sse95803::fmtDecFixed(r.qty_e3, 3) << "\n"
               << "  TradeMoney = " << sse95803::fmtDecFixed(r.money_e5, 5) << "\n"
-              << "  BSFlag     = " << (r.bs_flag ? r.bs_flag : '?') << "\n";
+              << "  BSFlag     = " << (r.bs_flag.empty() ? "?" : r.bs_flag) << "\n";
     if (!r.valid) {
         std::cout << "  [WARN] 解码失败\n";
     }
 }
 
-void emitStatBiz(const sse95803::TickRecord& r, uint32_t outer_seq,
-                 uint32_t frame_idx) {
-    printBizCsvHeaderOnce();
-    std::string tt = r.tick_time ? sse95803::fmtTickTime(r.tick_time) : "";
-    std::cout << ','                 // BizIndex
-              << ','                 // Channel
-              << r.security_id << ','
-              << tt << ','
-              << 'S' << ','
-              << ",,,,,"             // BuyNO,SellNO,Price,Qty,Money
-              << ','                 // BSFlag（状态记录没有）
-              << outer_seq << ',' << frame_idx << ",0\n";
-}
-
-void emitStatHuman(const sse95803::TickRecord& r, uint32_t outer_seq,
-                   const std::string& stream_tag, uint32_t frame_idx) {
-    std::cout << "\n[stat] " << stream_tag
-              << "  frame#" << frame_idx
-              << "  outer_seq=" << outer_seq << "\n"
-              << "  SecurityID = " << r.security_id << "\n";
-    if (r.tick_time)
-        std::cout << "  TransactTime = " << sse95803::fmtTickTime(r.tick_time)
-                  << " (" << r.tick_time << ")\n";
-}
-
 void emitRecord(const sse95803::TickRecord& r, uint32_t outer_seq,
                 const std::string& stream_tag, uint32_t frame_idx,
                 size_t rec_idx) {
-    if (r.is_status_record) {
-        switch (g_mode) {
-            case OutMode::BizCsv: emitStatBiz(r, outer_seq, frame_idx);               break;
-            case OutMode::Human:  emitStatHuman(r, outer_seq, stream_tag, frame_idx); break;
-            case OutMode::RawCsv: emitRaw(r, outer_seq, frame_idx, rec_idx);          break;
-        }
-        return;
-    }
     switch (g_mode) {
-        case OutMode::BizCsv: emitBiz(r, outer_seq, frame_idx);                       break;
-        case OutMode::RawCsv: emitRaw(r, outer_seq, frame_idx, rec_idx);              break;
+        case OutMode::BizCsv: emitBiz(r, outer_seq, frame_idx);                        break;
+        case OutMode::RawCsv: emitRaw(r, outer_seq, frame_idx, rec_idx);               break;
         case OutMode::Human:  emitHuman(r, outer_seq, stream_tag, frame_idx, rec_idx); break;
     }
 }
@@ -286,11 +253,6 @@ void decodeFrame(const uint8_t* frame_head, size_t frame_len,
     sse95803::TickRecord       rec;
     size_t rec_idx = 0;
     while (parser.next(rec)) {
-        if (rec.template_id != kWantLo && !rec.is_status_record) {
-            spdlog::trace("[frame] {} frame#{} rec#{} TID={} 不是 {}，跳过",
-                          stream_tag, frame_idx, rec_idx, rec.template_id, kWantLo);
-            continue;
-        }
         emitRecord(rec, outer_seq, stream_tag, frame_idx, rec_idx++);
     }
 }
@@ -310,7 +272,6 @@ public:
 private:
     std::vector<uint8_t> buf_;
     uint32_t             frame_idx_ = 0;
-    uint32_t             printed_   = 0;
 
     void drain() {
         while (buf_.size() >= 40) {
@@ -367,79 +328,15 @@ private:
                           stream_tag, hi, lo, kWantHi, kWantLo, length);
             return;
         }
-
         ++frame_idx_;
-        if (max_frames > 0 && printed_ >= max_frames) {
-            spdlog::info("[splitter] {} 已达到最大帧数限制 max_frames={}，停止",
-                         stream_tag, max_frames);
-            g_done = true;
-            return;
-        }
-        ++printed_;
         decodeFrame(f, length, stream_tag, frame_idx_);
     }
 };
 
 struct Context {
     uint16_t filter_port = 5261;
-    size_t   max_frames  = 0;
     std::unordered_map<uint32_t, std::unique_ptr<Splitter>> streams;
 };
 
-bool portMatch(const pcpp::ConnectionData& c, uint16_t port) {
-    return port == 0 || c.srcPort == port || c.dstPort == port;
-}
-
-void onConnStart(const pcpp::ConnectionData& c, void* cookie) {
-    auto* ctx = static_cast<Context*>(cookie);
-    if (!portMatch(c, ctx->filter_port)) {
-        spdlog::trace("[conn] 端口不匹配（filter={}），跳过 {}:{} -> {}:{}",
-                      ctx->filter_port,
-                      c.srcIP.toString(), c.srcPort,
-                      c.dstIP.toString(), c.dstPort);
-        return;
-    }
-    auto sp = std::make_unique<Splitter>();
-    sp->max_frames = ctx->max_frames;
-    std::ostringstream ss;
-    ss << c.srcIP.toString() << ":" << c.srcPort
-       << "->" << c.dstIP.toString() << ":" << c.dstPort;
-    sp->stream_tag = ss.str();
-    spdlog::info("[conn] 新连接: {}", sp->stream_tag);
-    ctx->streams[c.flowKey] = std::move(sp);
-}
-
-void onTcpData(int8_t, const pcpp::TcpStreamData& data, void* cookie) {
-    auto* ctx = static_cast<Context*>(cookie);
-    auto  it  = ctx->streams.find(data.getConnectionData().flowKey);
-    if (it == ctx->streams.end()) {
-        spdlog::trace("[conn] 收到未跟踪连接的数据 flowKey={}",
-                      data.getConnectionData().flowKey);
-        return;
-    }
-    it->second->feed(reinterpret_cast<const uint8_t*>(data.getData()),
-                     data.getDataLength());
-}
-
-void onConnEnd(const pcpp::ConnectionData& c,
-               pcpp::TcpReassembly::ConnectionEndReason reason, void* cookie) {
-    auto* ctx = static_cast<Context*>(cookie);
-    auto  it  = ctx->streams.find(c.flowKey);
-    if (it != ctx->streams.end()) {
-        spdlog::info("[conn] 连接结束: {} reason={}",
-                     it->second->stream_tag, static_cast<int>(reason));
-        ctx->streams.erase(it);
-    }
-}
-
-void parseCommonArgs(int argc, char** argv, int start,
-                     uint16_t& filter_port, OutMode& mode) {
-    filter_port = (argc > start) ? uint16_t(std::stoi(argv[start])) : 5261;
-    for (int i = start + 1; i < argc; ++i) {
-        std::string a = argv[i];
-        if      (a == "--csv")     mode = OutMode::BizCsv;
-        else if (a == "--raw-csv") mode = OutMode::RawCsv;
-    }
-}
 
 }  // namespace
