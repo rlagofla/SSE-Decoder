@@ -1,0 +1,22 @@
+# decode.toml — 上交所行情解码器配置
+
+[run]
+mode   = "pcap"              # "pcap" 读文件 | "iface" 监听网卡
+source = "data/output.pcap"   # pcap 文件路径 或 网卡名称（如 "eth0"）
+port   = 5261               # TCP 端口过滤（0 = 不过滤）
+
+[log]
+level = "info"              # trace / debug / info / warn / error
+
+# 每个 [[decode]] 块对应一种消息类型
+[[decode]]
+hi     = 9
+lo     = 5803
+output = "out/ua5803.csv"
+dedup  = true               # 跨 TCP 流去重（按 channel+biz_index）
+
+# [[decode]]
+# hi     = 6
+# lo     = 3202
+# output = "out/ua3202.csv"
+# dedup  = false

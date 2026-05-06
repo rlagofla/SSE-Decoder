@@ -1,34 +1,34 @@
-// main.cpp — 上交所 (9, 5803) 逐笔行情解码器
+// main.cpp — 上交所行情解码器
 //
 // 用法:
-//   decode <pcap>          <hi> <lo> [filter_port=5261]   # 离线文件
-//   decode --iface <名称>  <hi> <lo> [filter_port=5261]   # 实时抓包
+//   decode <config.toml>
 
+#include <fstream>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
+#include <vector>
+
 #include <PcapFileDevice.h>
 #include <PcapLiveDevice.h>
 #include <PcapLiveDeviceList.h>
 #include <Packet.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
 
+#include "config.hpp"
+#include "pipeline.hpp"
 #include "utils.hpp"
-#include "SsePipeline.hpp"
-
 
 void onConnStart(const pcpp::ConnectionData& c, void* cookie) {
     auto* ctx = static_cast<Context*>(cookie);
-    if (!portMatch(c, ctx->filter_port)) {
-        spdlog::trace("[conn] 端口不匹配（filter={}），跳过 {}:{} -> {}:{}",
-                      ctx->filter_port,
-                      c.srcIP.toString(), c.srcPort,
-                      c.dstIP.toString(), c.dstPort);
+    if (!utils::portMatch(c, ctx->filter_port)) {
+        spdlog::trace("[conn] 端口不匹配（filter={}），跳过 {}:{} -> {}:{}", ctx->filter_port, c.srcIP.toString(), c.srcPort, c.dstIP.toString(), c.dstPort);
         return;
     }
     auto sp = std::make_unique<Splitter>();
-    sp->want_hi = ctx->want_hi;
-    sp->want_lo = ctx->want_lo;
+    sp->ctx = ctx;
     std::ostringstream ss;
     ss << c.srcIP.toString() << ":" << c.srcPort
        << "->" << c.dstIP.toString() << ":" << c.dstPort;
@@ -41,12 +41,10 @@ void onTcpData(int8_t, const pcpp::TcpStreamData& data, void* cookie) {
     auto* ctx = static_cast<Context*>(cookie);
     auto  it  = ctx->streams.find(data.getConnectionData().flowKey);
     if (it == ctx->streams.end()) {
-        spdlog::trace("[conn] 收到未跟踪连接的数据 flowKey={}",
-                      data.getConnectionData().flowKey);
+        spdlog::trace("[conn] 收到未跟踪连接的数据 flowKey={}", data.getConnectionData().flowKey);
         return;
     }
-    it->second->feed(reinterpret_cast<const uint8_t*>(data.getData()),
-                     data.getDataLength());
+    it->second->feed(reinterpret_cast<const uint8_t*>(data.getData()), data.getDataLength());
 }
 
 void onConnEnd(const pcpp::ConnectionData& c,
@@ -54,68 +52,81 @@ void onConnEnd(const pcpp::ConnectionData& c,
     auto* ctx = static_cast<Context*>(cookie);
     auto  it  = ctx->streams.find(c.flowKey);
     if (it != ctx->streams.end()) {
-        spdlog::info("[conn] 连接结束: {} reason={}",
-                     it->second->stream_tag, static_cast<int>(reason));
+        spdlog::info("[conn] 连接结束: {} reason={}", it->second->stream_tag, static_cast<int>(reason));
         ctx->streams.erase(it);
     }
 }
 
 int main(int argc, char** argv) {
-    // spdlog::set_level(spdlog::level::trace);
     spdlog::set_default_logger(spdlog::stderr_color_mt("console"));
 
-    bool        live_mode  = false;
-    std::string source;     // pcap 文件路径 或 网卡名
-
-    // 解析 --iface 标志
-    int pos = 1;
-    if (argc > 2 && std::string(argv[1]) == "--iface") {
-        live_mode = true;
-        source    = argv[2];
-        pos       = 3;
-    } else if (argc > 1) {
-        source = argv[1];
-        pos    = 2;
-    }
-
-    if (argc - pos < 2) {
-        std::cerr << "用法:\n"
-                  << "  " << argv[0] << " <pcap>         <hi> <lo> [filter_port=5261]\n"
-                  << "  " << argv[0] << " --iface <名称> <hi> <lo> [filter_port=5261]\n";
+    if (argc < 2) {
+        std::cerr << "用法: " << argv[0] << " <config.toml>\n";
         return 1;
     }
 
+    Config cfg;
+    try {
+        cfg = loadConfig(argv[1]);
+    } catch (const std::exception& e) {
+        spdlog::error("配置加载失败: {}", e.what());
+        return 1;
+    }
+
+    // 设置日志级别
+    {
+        auto lvl = spdlog::level::info;
+        if      (cfg.log_level == "trace") lvl = spdlog::level::trace;
+        else if (cfg.log_level == "debug") lvl = spdlog::level::debug;
+        else if (cfg.log_level == "warn")  lvl = spdlog::level::warn;
+        else if (cfg.log_level == "error") lvl = spdlog::level::err;
+        spdlog::set_level(lvl);
+    }
+
+    // 打开各类型的输出文件，构建 Context
+    // ofstreams 在 main 栈上存活，ActiveType 持非拥有指针
+    std::vector<std::unique_ptr<std::ofstream>> outfiles;
     Context ctx;
-    ctx.want_hi     = uint32_t(std::stoul(argv[pos]));
-    ctx.want_lo     = uint32_t(std::stoul(argv[pos + 1]));
-    ctx.filter_port = (argc - pos >= 3) ? uint16_t(std::stoi(argv[pos + 2])) : 5261;
+    ctx.filter_port = cfg.port;
+
+    for (auto& tc : cfg.types) {
+        auto ofs = std::make_unique<std::ofstream>(tc.output);
+        if (!ofs->is_open()) {
+            spdlog::error("无法打开输出文件: {}", tc.output);
+            return 1;
+        }
+        ActiveType at{ tc.hi, tc.lo, tc.dedup, ofs.get() };
+        ctx.types.push_back(at);
+        outfiles.push_back(std::move(ofs));
+        spdlog::info("[main] 类型 ({},{}) -> {}", tc.hi, tc.lo, tc.output);
+    }
 
     pcpp::TcpReassembly reassembly(onTcpData, &ctx, onConnStart, onConnEnd);
 
-    if (live_mode) {
-        auto* dev = pcpp::PcapLiveDeviceList::getInstance().getPcapLiveDeviceByName(source);
+    if (cfg.mode == "iface") {
+        auto* dev = pcpp::PcapLiveDeviceList::getInstance().getPcapLiveDeviceByName(cfg.source);
         if (!dev) {
-            spdlog::error("[conn] 找不到网卡: {}", source);
+            spdlog::error("[conn] 找不到网卡: {}", cfg.source);
             return 1;
         }
         if (!dev->open()) {
-            spdlog::error("[conn] 打开网卡失败: {}", source);
+            spdlog::error("[conn] 打开网卡失败: {}", cfg.source);
             return 1;
         }
-        spdlog::info("[conn] 开始监听网卡: {}", source);
+        spdlog::info("[conn] 开始监听网卡: {}", cfg.source);
         dev->startCapture([](pcpp::RawPacket* raw, pcpp::PcapLiveDevice*, void* cookie) {
             static_cast<pcpp::TcpReassembly*>(cookie)->reassemblePacket(raw);
         }, &reassembly);
 
         std::string line;
-        std::getline(std::cin, line);  // 回车退出
+        std::getline(std::cin, line);   // 按回车退出
 
         dev->stopCapture();
         dev->close();
     } else {
-        pcpp::PcapFileReaderDevice reader(source);
+        pcpp::PcapFileReaderDevice reader(cfg.source);
         if (!reader.open()) {
-            spdlog::error("[conn] 打开 pcap 失败: {}", source);
+            spdlog::error("[conn] 打开 pcap 失败: {}", cfg.source);
             return 1;
         }
         pcpp::RawPacket raw;

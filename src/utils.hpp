@@ -11,9 +11,9 @@
 #include <zlib.h>
 #include <TcpReassembly.h>
 
-// ---- FAST 协议底层 ----
+namespace utils {
 
-namespace fast {
+// ---- FAST 协议底层 ----
 
 enum class Status {
     Ok,
@@ -54,8 +54,6 @@ inline std::pair<uint64_t, bool> decNull(uint64_t enc) {
     return {enc - 1, false};
 }
 
-}  // namespace fast
-
 // ---- 二进制读取 ----
 
 inline uint32_t readBE32(const uint8_t* p) {
@@ -76,28 +74,28 @@ enum class InflateStatus {
     NoProgress,
 };
 
+inline const char* zipStatusStr(InflateStatus s) {
+    static constexpr const char* t[] = {"Ok","BadMagic","BadMethod","OffsetOverflow","SizeOverflow","InitFailed","DataError","NoProgress"};
+    return t[static_cast<int>(s)];
+}
+
 inline InflateStatus rawInflateZipLFH(const uint8_t* body, size_t n, std::vector<uint8_t>& out) {
-    if (n < 30 || body[0] != 'P' || body[1] != 'K' ||
-        body[2] != 3 || body[3] != 4)
+    if (n < 30 || body[0] != 'P' || body[1] != 'K' || body[2] != 3 || body[3] != 4)
         return InflateStatus::BadMagic;
 
     uint16_t method = uint16_t(body[8]) | (uint16_t(body[9]) << 8);
-    if (method != 8)
-        return InflateStatus::BadMethod;
+    if (method != 8) return InflateStatus::BadMethod;
 
     uint16_t name_len  = uint16_t(body[26]) | (uint16_t(body[27]) << 8);
     uint16_t extra_len = uint16_t(body[28]) | (uint16_t(body[29]) << 8);
     size_t   start     = 30u + name_len + extra_len;
-    if (start >= n)
-        return InflateStatus::OffsetOverflow;
+    if (start >= n) return InflateStatus::OffsetOverflow;
 
     size_t compressed_size = n - start;
-    if (compressed_size > std::numeric_limits<uInt>::max())
-        return InflateStatus::SizeOverflow;
+    if (compressed_size > std::numeric_limits<uInt>::max()) return InflateStatus::SizeOverflow;
 
     z_stream zs{};
-    if (inflateInit2(&zs, -MAX_WBITS) != Z_OK)
-        return InflateStatus::InitFailed;
+    if (inflateInit2(&zs, -MAX_WBITS) != Z_OK) return InflateStatus::InitFailed;
 
     zs.next_in  = const_cast<Bytef*>(body + start);
     zs.avail_in = uInt(compressed_size);
@@ -112,7 +110,7 @@ inline InflateStatus rawInflateZipLFH(const uint8_t* body, size_t n, std::vector
         uInt before_in  = zs.avail_in;
         uInt before_out = zs.avail_out;
 
-        ret = inflate(&zs, Z_NO_FLUSH);
+        ret = ::inflate(&zs, Z_NO_FLUSH);
 
         if (ret != Z_OK && ret != Z_STREAM_END) {
             inflateEnd(&zs);
@@ -163,3 +161,5 @@ inline std::string fmtTickTime(uint32_t t) {
 inline bool portMatch(const pcpp::ConnectionData& c, uint16_t port) {
     return port == 0 || c.srcPort == port || c.dstPort == port;
 }
+
+}  // namespace utils
