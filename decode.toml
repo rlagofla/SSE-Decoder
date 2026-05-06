@@ -15,8 +15,8 @@ lo     = 5803
 output = "out/ua5803.csv"
 dedup  = true               # 跨 TCP 流去重（按 channel+biz_index）
 
-# [[decode]]
-# hi     = 6
-# lo     = 3202
-# output = "out/ua3202.csv"
-# dedup  = false
+[[decode]]
+hi     = 6
+lo     = 3202
+output = "out/ua3202.csv"
+dedup  = false
