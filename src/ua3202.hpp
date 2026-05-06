@@ -112,6 +112,29 @@ struct Msg {
     bool valid = false;
 };
 
+void print_hex(const uint8_t* body, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        fprintf(stderr, "%02X ", body[i]);
+        if ((i + 1) % 16 == 0 && i + 1 < len) {
+            fputc('\n', stderr);
+        }
+    }
+    fputc('\n', stderr);
+}
+
+void print_fast_hex_stderr(const uint8_t* body, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        fprintf(stderr, "%02X", body[i]);          // 打印当前字节
+        if (body[i] & 0x80) {                     // 如果是停止位（bit7=1）
+            fputc('\n', stderr);                  // 字段结束，换行
+        } else {
+            fputc(' ', stderr);                   // 字段未结束，输出空格
+        }
+    }
+    // 如果最后一行没有以换行结尾（例如 len==0 或末尾字节停止位本身会换行），确保不重复换行
+    // 这里不需要额外操作，因为停止位字节已经换行了。
+}
+
 class Parser {
 public:
     Parser(const uint8_t* body, size_t len) : body_(body), len_(len) {}
@@ -120,12 +143,16 @@ public:
         rec = Msg{};
         if (cursor_ >= len_) return false;
 
+        // print_fast_hex_stderr(body_, len_);
+        // fprintf(stderr, "================================================");
+
         uint64_t bits = 0;
         size_t   pm_len = 0;
         if (utils::readFast(body_ + cursor_, len_ - cursor_, bits, pm_len) != utils::Status::Ok) {
             spdlog::warn("[ua3202] PMAP 读取失败: cursor={} remaining={}", cursor_, len_ - cursor_);
             return false;
         }
+        print_fast_hex_stderr(body_ + cursor_, pm_len);
         cursor_ += pm_len;
         rec.pmap_raw = bits;
         if (pm_len != 7) {
@@ -141,6 +168,7 @@ public:
                 spdlog::warn("[ua3202] bit{} 读取失败: cursor={}", bit, cursor_);
                 return false;
             }
+            print_fast_hex_stderr(body_ + cursor_, w);
             cursor_ += w;
             auto [x, is_null] = utils::decNull(v);
             if (!is_null) last_val = decltype(last_val)(x);
@@ -154,6 +182,7 @@ public:
                 spdlog::warn("[ua3202] bit{} 读取失败: cursor={}", bit, cursor_);
                 return false;
             }
+            print_fast_hex_stderr(body_ + cursor_, w);
             cursor_ += w;
             last_val = decltype(last_val)(v);
             return true;
@@ -166,6 +195,7 @@ public:
                 spdlog::warn("[ua3202] bit{} ASCII 读取失败: cursor={}", bit, cursor_);
                 return false;
             }
+            print_fast_hex_stderr(body_ + cursor_, w);
             cursor_ += w;
             last_val = std::move(s);
             return true;
@@ -189,12 +219,29 @@ public:
         if (!rff(46, last_data_status_)) return false; rec.data_status = last_data_status_;
 
         // SecurityID: none 类型，始终存在
-        { size_t w; if (utils::readAscii(body_ + cursor_, len_ - cursor_, last_sec_id_, w) != utils::Status::Ok) { spdlog::warn("[ua3202] SecurityID 读取失败: cursor={}", cursor_); return false; } cursor_ += w; }
+        {
+        size_t w; 
+        if (utils::readAscii(body_ + cursor_, len_ - cursor_, last_sec_id_, w) != utils::Status::Ok) { 
+            spdlog::warn("[ua3202] SecurityID 读取失败: cursor={}", cursor_);
+            return false;
+        } 
+        print_fast_hex_stderr(body_ + cursor_, w);
+        cursor_ += w;
         rec.security_id = last_sec_id_;
+        }
 
         // ImageStatus: none 类型，始终存在，普通 FAST 整数
-        { uint64_t v; size_t w; if (utils::readFast(body_ + cursor_, len_ - cursor_, v, w) != utils::Status::Ok) { spdlog::warn("[ua3202] ImageStatus 读取失败: cursor={}", cursor_); return false; } cursor_ += w; last_image_status_ = uint32_t(v); }
+        {
+        uint64_t v; size_t w;
+        if (utils::readFast(body_ + cursor_, len_ - cursor_, v, w) != utils::Status::Ok) {
+            spdlog::warn("[ua3202] ImageStatus 读取失败: cursor={}", cursor_); 
+            return false; 
+        } 
+        print_fast_hex_stderr(body_ + cursor_, w);
+        cursor_ += w; 
+        last_image_status_ = uint32_t(v);
         rec.image_status = last_image_status_;
+        }
 
         if (!rfn(45, last_pre_close_px_)) return false; rec.pre_close_px = last_pre_close_px_;
         if (!rfn(44, last_open_px_)) return false; rec.open_px = last_open_px_;
@@ -238,10 +285,30 @@ public:
         if (!rfn(6,  last_num_offer_orders_)) return false; rec.num_offer_orders = last_num_offer_orders_;
 
         // NoBidLevel: none 类型，始终存在
-        { uint64_t n; size_t w; if (utils::readFast(body_ + cursor_, len_ - cursor_, n, w) != utils::Status::Ok) { spdlog::warn("[ua3202] NoBidLevel 读取失败: cursor={}", cursor_); return false; } cursor_ += w; if (!readLevels(n, rec.bid_levels, "bid")) return false; }
+        {
+        uint64_t n; size_t w; 
+        if (utils::readFast(body_ + cursor_, len_ - cursor_, n, w) != utils::Status::Ok) { 
+            spdlog::warn("[ua3202] NoBidLevel 读取失败: cursor={}", cursor_); 
+            return false;
+        } 
+        print_fast_hex_stderr(body_ + cursor_, w);
+        cursor_ += w; 
+        auto [x, is_null] = utils::decNull(n);
+        if (!readLevels(x, rec.bid_levels, "bid")) return false;
+        }
 
         // NoOfferLevel: none 类型，始终存在
-        { uint64_t n; size_t w; if (utils::readFast(body_ + cursor_, len_ - cursor_, n, w) != utils::Status::Ok) { spdlog::warn("[ua3202] NoOfferLevel 读取失败: cursor={}", cursor_); return false; } cursor_ += w; if (!readLevels(n, rec.offer_levels, "offer")) return false; }
+        {
+        uint64_t n; size_t w; 
+        if (utils::readFast(body_ + cursor_, len_ - cursor_, n, w) != utils::Status::Ok) {
+            spdlog::warn("[ua3202] NoOfferLevel 读取失败: cursor={}", cursor_); 
+            return false; 
+        } 
+        print_fast_hex_stderr(body_ + cursor_, w);
+        cursor_ += w; 
+        auto [x, is_null] = utils::decNull(n);
+        if (!readLevels(x, rec.offer_levels, "offer")) return false;
+        }
 
         rec.valid = true;
         return true;
@@ -298,6 +365,7 @@ private:
     uint32_t    last_num_offer_orders_       = 0;
 
     bool readLevels(uint64_t n, std::vector<PriceLevel>& levels, const char* side) {
+        fprintf(stderr, "n=%d\n", n);
         levels.resize(n);
         int64_t  last_price      = 0;
         int64_t  last_qty        = 0;
@@ -308,6 +376,7 @@ private:
                 spdlog::warn("[ua3202] {} level[{}] sub-PMAP 读取失败: cursor={}", side, i, cursor_);
                 return false;
             }
+            print_fast_hex_stderr(body_ + cursor_, spm);
             cursor_ += spm;
             if (spm != 1) {
                 spdlog::warn("[ua3202] {} level[{}] sub-PMAP 长度异常: spm={}", side, i, spm);
@@ -322,6 +391,7 @@ private:
                     spdlog::warn("[ua3202] {} level[{}] sub-bit{} 读取失败: cursor={}", side, i, bit, cursor_);
                     return false;
                 }
+                print_fast_hex_stderr(body_ + cursor_, w);
                 cursor_ += w;
                 auto [x, is_null] = utils::decNull(v);
                 if (!is_null) lv = decltype(lv)(x);
@@ -338,15 +408,18 @@ private:
                 spdlog::warn("[ua3202] {} level[{}] Orders count 读取失败: cursor={}", side, i, cursor_);
                 return false;
             }
+            print_fast_hex_stderr(body_ + cursor_, ow);
             cursor_ += ow;
-            levels[i].orders.resize(n_orders);
+            auto [x, is_null] = utils::decNull(n_orders);
+            levels[i].orders.resize(x);
             int64_t last_oqty = 0;
-            for (uint64_t j = 0; j < n_orders; ++j) {
+            for (uint64_t j = 0; j < x; ++j) {
                 uint64_t obits = 0; size_t opm;
                 if (utils::readFast(body_ + cursor_, len_ - cursor_, obits, opm) != utils::Status::Ok) {
                     spdlog::warn("[ua3202] {} level[{}] order[{}] sub-PMAP 读取失败: cursor={}", side, i, j, cursor_);
                     return false;
                 }
+                print_fast_hex_stderr(body_ + cursor_, opm);
                 cursor_ += opm;
                 if (obits & (1ull << 6)) { spdlog::warn("[ua3202] {} level[{}] order[{}] OrderQueueOperator 不应出现", side, i, j); return false; }
                 if (obits & (1ull << 5)) { spdlog::warn("[ua3202] {} level[{}] order[{}] OrderQueueOperatorEntryID 不应出现", side, i, j); return false; }
@@ -356,6 +429,7 @@ private:
                         spdlog::warn("[ua3202] {} level[{}] order[{}] OrderQty 读取失败: cursor={}", side, i, j, cursor_);
                         return false;
                     }
+                    print_fast_hex_stderr(body_ + cursor_, w);
                     cursor_ += w;
                     auto [x, is_null] = utils::decNull(v);
                     if (!is_null) last_oqty = int64_t(x);
