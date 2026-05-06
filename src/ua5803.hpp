@@ -47,8 +47,7 @@ struct Msg {
 
 class Parser {
 public:
-    Parser(const uint8_t* body, size_t len)
-        : body_(body), len_(len) {}
+    Parser(const uint8_t* body, size_t len): body_(body), len_(len) {}
 
     bool next(Msg& rec) {
         rec = Msg{};
@@ -268,8 +267,7 @@ private:
 // 跨 TCP 流去重: key = (channel << 32) | uint32_t(biz_index)
 inline std::unordered_set<uint64_t> g_seen;
 
-inline void emit(const Msg& r, uint32_t outer_seq, uint32_t frame_idx,
-                 size_t rec_idx, bool dedup, std::ostream& out) {
+inline void emit(const Msg& r, uint32_t outer_seq, uint32_t frame_idx, size_t rec_idx, bool dedup, std::ostream& out) {
     if (dedup) {
         uint64_t key = (uint64_t(r.channel) << 32) | uint32_t(r.biz_index);
         if (!g_seen.insert(key).second) return;
