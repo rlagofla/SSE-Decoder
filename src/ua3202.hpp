@@ -66,7 +66,7 @@ struct Msg {
     uint32_t    tick_time             = 0;
     uint32_t    data_status           = 0;
     std::string security_id;
-    std::string image_status;
+    uint32_t    image_status          = 0;
     int64_t     pre_close_px          = 0;
     int64_t     open_px               = 0;
     int64_t     high_px               = 0;
@@ -146,6 +146,18 @@ public:
             if (!is_null) last_val = decltype(last_val)(x);
             return true;
         };
+        // 读普通 FAST 整数（非 nullable），pmap bit 为 0 则保持 last_val 不变
+        auto rff = [&](int bit, auto& last_val) -> bool {
+            if (!(bits & (1ull << bit))) return true;
+            uint64_t v; size_t w;
+            if (utils::readFast(body_ + cursor_, len_ - cursor_, v, w) != utils::Status::Ok) {
+                spdlog::warn("[ua3202] bit{} 读取失败: cursor={}", bit, cursor_);
+                return false;
+            }
+            cursor_ += w;
+            last_val = decltype(last_val)(v);
+            return true;
+        };
         // 读 ASCII 字符串字段
         auto rfa = [&](int bit, std::string& last_val) -> bool {
             if (!(bits & (1ull << bit))) return true;
@@ -173,15 +185,15 @@ public:
             rec.template_id = 3202;
         }
 
-        if (!rfn(47, last_tick_time_)) return false; rec.tick_time = last_tick_time_;
-        if (!rfn(46, last_data_status_)) return false; rec.data_status = last_data_status_;
+        if (!rff(47, last_tick_time_)) return false; rec.tick_time = last_tick_time_;
+        if (!rff(46, last_data_status_)) return false; rec.data_status = last_data_status_;
 
         // SecurityID: none 类型，始终存在
         { size_t w; if (utils::readAscii(body_ + cursor_, len_ - cursor_, last_sec_id_, w) != utils::Status::Ok) { spdlog::warn("[ua3202] SecurityID 读取失败: cursor={}", cursor_); return false; } cursor_ += w; }
         rec.security_id = last_sec_id_;
 
-        // ImageStatus: none 类型，始终存在
-        { size_t w; if (utils::readAscii(body_ + cursor_, len_ - cursor_, last_image_status_, w) != utils::Status::Ok) { spdlog::warn("[ua3202] ImageStatus 读取失败: cursor={}", cursor_); return false; } cursor_ += w; }
+        // ImageStatus: none 类型，始终存在，普通 FAST 整数
+        { uint64_t v; size_t w; if (utils::readFast(body_ + cursor_, len_ - cursor_, v, w) != utils::Status::Ok) { spdlog::warn("[ua3202] ImageStatus 读取失败: cursor={}", cursor_); return false; } cursor_ += w; last_image_status_ = uint32_t(v); }
         rec.image_status = last_image_status_;
 
         if (!rfn(45, last_pre_close_px_)) return false; rec.pre_close_px = last_pre_close_px_;
@@ -243,7 +255,7 @@ private:
     uint32_t    last_tick_time_              = 0;
     uint32_t    last_data_status_            = 0;
     std::string last_sec_id_;
-    std::string last_image_status_;
+    uint32_t    last_image_status_           = 0;
     int64_t     last_pre_close_px_           = 0;
     int64_t     last_open_px_                = 0;
     int64_t     last_high_px_                = 0;
@@ -387,7 +399,7 @@ inline void emit(const Msg& r, uint32_t outer_seq, uint32_t frame_idx, size_t re
     out << r.security_id << ','
         << utils::fmtTickTime(r.tick_time) << ','
         << r.data_status << ','
-        << (r.image_status.empty() ? "?" : r.image_status) << ','
+        << r.image_status << ','
         << (r.instrument_status.empty() ? "?" : r.instrument_status) << ','
         << (r.trading_phase_code.empty() ? "?" : r.trading_phase_code) << ','
         << px(r.pre_close_px) << ',' << px(r.open_px) << ',' << px(r.high_px) << ','

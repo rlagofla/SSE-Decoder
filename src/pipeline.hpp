@@ -13,6 +13,7 @@
 #include <spdlog/spdlog.h>
 
 #include "utils.hpp"
+#include "ua3202.hpp"
 #include "ua5803.hpp"
 
 // ---- 帧头（40 字节，大端） ----
@@ -145,10 +146,14 @@ private:
                         ua5803::emit(rec, hdr.outer_seq, frame_idx_, rec_idx++, t.dedup, *t.out);
                     break;
                 }
-                case (uint64_t(6) << 32) | 3202:
-                    // ua3202 Parser/emit 待实现，见 ua3202.hpp
-                    spdlog::debug("[ua3202] {} frame#{} outer_seq={} — 解析器尚未实现，跳过", stream_tag, frame_idx_, hdr.outer_seq);
+                case (uint64_t(6) << 32) | 3202: {
+                    ua3202::Parser parser(body, blen);
+                    ua3202::Msg    rec;
+                    size_t         rec_idx = 0;
+                    while (parser.next(rec))
+                        ua3202::emit(rec, hdr.outer_seq, frame_idx_, rec_idx++, t.dedup, *t.out);
                     break;
+                }
                 default:
                     spdlog::warn("[pipeline] {} 类型 ({},{}) 已配置但暂未实现，跳过", stream_tag, t.hi, t.lo);
             }
