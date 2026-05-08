@@ -9,8 +9,8 @@
 #include <toml.hpp>
 
 struct TypeConfig {
-    uint32_t    hi;
-    uint32_t    lo;
+    uint32_t    category_id;
+    uint32_t    msg_type;
     std::string output;   // CSV 输出文件路径
     bool        dedup = true;
 };
@@ -18,7 +18,7 @@ struct TypeConfig {
 struct Config {
     std::string          mode      = "pcap";   // "pcap" 或 "iface"
     std::string          source;               // pcap 路径 或 网卡名
-    uint16_t             port      = 5261;
+    uint16_t             port      = 9129;
     std::string          log_level = "info";   // trace/debug/info/warn/error
     std::vector<TypeConfig> types;
 };
@@ -34,15 +34,15 @@ inline Config loadConfig(const std::string& path) {
     Config cfg;
     cfg.mode      = tbl["run"]["mode"].value_or(std::string("pcap"));
     cfg.source    = tbl["run"]["source"].value_or(std::string(""));
-    cfg.port      = static_cast<uint16_t>(tbl["run"]["port"].value_or(int64_t(5261)));
+    cfg.port      = static_cast<uint16_t>(tbl["run"]["port"].value_or(int64_t(9129)));
     cfg.log_level = tbl["log"]["level"].value_or(std::string("info"));
 
     if (auto* arr = tbl["decode"].as_array()) {
         for (auto&& elem : *arr) {
             if (auto* t = elem.as_table()) {
                 TypeConfig tc;
-                tc.hi     = static_cast<uint32_t>((*t)["hi"].value_or(int64_t(0)));
-                tc.lo     = static_cast<uint32_t>((*t)["lo"].value_or(int64_t(0)));
+                tc.category_id = static_cast<uint32_t>((*t)["category_id"].value_or(int64_t(0)));
+                tc.msg_type    = static_cast<uint32_t>((*t)["msg_type"].value_or(int64_t(0)));
                 tc.output = (*t)["output"].value_or(std::string(""));
                 tc.dedup  = (*t)["dedup"].value_or(true);
                 cfg.types.push_back(std::move(tc));

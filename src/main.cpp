@@ -101,10 +101,10 @@ int main(int argc, char** argv) {
             spdlog::error("无法打开输出文件: {}", tc.output);
             return 1;
         }
-        ActiveType at{ tc.hi, tc.lo, tc.dedup, ofs.get() };
+        ActiveType at{ tc.category_id, tc.msg_type, tc.dedup, ofs.get() };
         ctx.types.push_back(at);
         outfiles.push_back(std::move(ofs));
-        spdlog::info("[main] 类型 ({},{}) -> {}", tc.hi, tc.lo, tc.output);
+        spdlog::info("[main] 类型 ({},{}) -> {}", tc.category_id, tc.msg_type, tc.output);
     }
 
     pcpp::TcpReassembly reassembly(onTcpData, &ctx, onConnStart, onConnEnd);
