@@ -53,6 +53,7 @@ class Splitter;
 
 struct Context {
     uint16_t filter_port = 5261;
+    timespec last_ts{};   // 触发当前回调的 RawPacket 时间戳，由 main 在 reassemblePacket 前更新
     std::vector<ActiveType> types;
     std::unordered_map<uint32_t, std::unique_ptr<Splitter>> streams;
 };
@@ -77,26 +78,26 @@ private:
         while (buf_.size() >= 40) {
             size_t idx = scanMagic();
             if (idx == std::string::npos) {
-                spdlog::trace("[splitter] {} 未找到魔数，保留尾部 3 字节，丢弃 {} 字节", stream_tag, buf_.size() > 3 ? buf_.size() - 3 : 0u);
+                spdlog::warn("[splitter] ts={}, {} 未找到魔数，保留尾部 3 字节，丢弃 {} 字节", utils::fmtPktTime(ctx->last_ts), stream_tag, buf_.size() > 3 ? buf_.size() - 3 : 0u);
                 if (buf_.size() > 3) buf_.erase(buf_.begin(), buf_.end() - 3);
                 return;
             }
             if (idx > 0) {
-                spdlog::trace("[splitter] {} 魔数前有 {} 字节无效数据，跳过", stream_tag, idx);
+                spdlog::warn("[splitter] ts={}, {} 魔数前有 {} 字节无效数据，跳过", utils::fmtPktTime(ctx->last_ts), stream_tag, idx);
                 buf_.erase(buf_.begin(), buf_.begin() + idx);
             }
             if (buf_.size() < 40) {
-                spdlog::trace("[splitter] {} 魔数已对齐但 header 不足 40 字节（{}），等待", stream_tag, buf_.size());
+                spdlog::debug("[splitter] ts={}, {} 魔数已对齐但 header 不足 40 字节（{}），等待", utils::fmtPktTime(ctx->last_ts), stream_tag, buf_.size());
                 return;
             }
             FrameHeader hdr = FrameHeader::from(buf_.data());
             if (hdr.length < 40 || hdr.length > 16u * 1024u * 1024u) {
-                spdlog::warn("[splitter] {} 帧长度异常 length={}（期望 40~16M），跳过 4 字节继续扫描", stream_tag, hdr.length);
+                spdlog::warn("[splitter] ts={}, {} 帧长度异常 length={}（期望 40~16M），跳过 4 字节继续扫描", utils::fmtPktTime(ctx->last_ts), stream_tag, hdr.length);
                 buf_.erase(buf_.begin(), buf_.begin() + 4);
                 continue;
             }
             if (buf_.size() < hdr.length) {
-                spdlog::trace("[splitter] {} 帧数据不完整: need={} have={}，等待", stream_tag, hdr.length, buf_.size());
+                spdlog::debug("[splitter] ts={}, {} 帧数据不完整: need={} have={}，等待", utils::fmtPktTime(ctx->last_ts), stream_tag, hdr.length, buf_.size());
                 return;
             }
             handleFrame(buf_.data(), hdr);
@@ -127,14 +128,13 @@ private:
             if (hdr.comp == 1) {
                 auto ist = utils::rawInflateZipLFH(body, blen, inflated);
                 if (ist != utils::InflateStatus::Ok) {
-                    spdlog::warn("[pipeline] {} frame#{} inflate 失败({}), 跳过 outer_seq={}", stream_tag, frame_idx_, utils::zipStatusStr(ist), hdr.outer_seq);
+                    spdlog::warn("[pipeline] {} frame#{} ts={} inflate 失败({}), 跳过 outer_seq={}", stream_tag, frame_idx_, utils::fmtPktTime(ctx->last_ts), utils::zipStatusStr(ist), hdr.outer_seq);
                     return;
                 }
-                spdlog::trace("[pipeline] {} frame#{} inflate ok: {} -> {} bytes", stream_tag, frame_idx_, blen, inflated.size());
                 body = inflated.data();
                 blen = inflated.size();
             }
-            spdlog::trace("[pipeline] {} frame#{} outer_seq={} comp={} body_len={}", stream_tag, frame_idx_, hdr.outer_seq, hdr.comp, blen);
+            spdlog::debug("[pipeline] {} frame#{} ts={} outer_seq={} comp={} body_len={}", stream_tag, frame_idx_, utils::fmtPktTime(ctx->last_ts), hdr.outer_seq, hdr.comp, blen);
 
             // 按类型解析 + 输出
             switch ((uint64_t(t.hi) << 32) | t.lo) {
@@ -142,8 +142,10 @@ private:
                     ua5803::Parser parser(body, blen);
                     ua5803::Msg    rec;
                     size_t         rec_idx = 0;
-                    while (parser.next(rec))
+                    while (parser.next(rec)) {
                         ua5803::emit(rec, hdr.outer_seq, frame_idx_, rec_idx++, t.dedup, *t.out);
+                        spdlog::debug("[pipeline] ts={}, emit 成功，TickTime {}", utils::fmtPktTime(ctx->last_ts), rec.tick_time);
+                    }
                     break;
                 }
                 case (uint64_t(6) << 32) | 3202: {
@@ -157,8 +159,9 @@ private:
                 default:
                     spdlog::warn("[pipeline] {} 类型 ({},{}) 已配置但暂未实现，跳过", stream_tag, t.hi, t.lo);
             }
+            spdlog::debug("[pipeline] ts={}, handle 成功，类型 ({},{})", utils::fmtPktTime(ctx->last_ts), hdr.type_hi, hdr.type_lo);
             return;
         }
-        spdlog::trace("[pipeline] {} 帧类型 ({},{}) 不在配置中，跳过 length={}", stream_tag, hdr.type_hi, hdr.type_lo, hdr.length);
+        spdlog::debug("[pipeline] {} 帧类型 ({},{}) 不在配置中，跳过 length={}", stream_tag, hdr.type_hi, hdr.type_lo, hdr.length);
     }
 };

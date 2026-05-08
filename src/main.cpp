@@ -21,6 +21,10 @@
 #include "pipeline.hpp"
 #include "utils.hpp"
 
+#include <IPv4Layer.h>
+#include <TcpLayer.h>
+#include <arpa/inet.h>   // ntohs
+
 void onConnStart(const pcpp::ConnectionData& c, void* cookie) {
     auto* ctx = static_cast<Context*>(cookie);
     if (!utils::portMatch(c, ctx->filter_port)) {
@@ -39,11 +43,13 @@ void onConnStart(const pcpp::ConnectionData& c, void* cookie) {
 
 void onTcpData(int8_t, const pcpp::TcpStreamData& data, void* cookie) {
     auto* ctx = static_cast<Context*>(cookie);
+    spdlog::debug("[tcpdata] ts={} flowKey={} len={}", utils::fmtPktTime(ctx->last_ts), data.getConnectionData().flowKey, data.getDataLength());
     auto  it  = ctx->streams.find(data.getConnectionData().flowKey);
     if (it == ctx->streams.end()) {
-        spdlog::trace("[conn] 收到未跟踪连接的数据 flowKey={}", data.getConnectionData().flowKey);
+        spdlog::warn("[conn] 收到未跟踪连接的数据 flowKey={}", data.getConnectionData().flowKey);
         return;
     }
+    spdlog::debug("[conn] ts={} {} {} bytes", utils::fmtPktTime(ctx->last_ts), it->second->stream_tag, data.getDataLength());
     it->second->feed(reinterpret_cast<const uint8_t*>(data.getData()), data.getDataLength());
 }
 
@@ -114,9 +120,31 @@ int main(int argc, char** argv) {
             return 1;
         }
         spdlog::info("[conn] 开始监听网卡: {}", cfg.source);
+        struct IfaceCookie { pcpp::TcpReassembly* reasm; Context* ctx; };
+        IfaceCookie ic{ &reassembly, &ctx };
         dev->startCapture([](pcpp::RawPacket* raw, pcpp::PcapLiveDevice*, void* cookie) {
-            static_cast<pcpp::TcpReassembly*>(cookie)->reassemblePacket(raw);
-        }, &reassembly);
+            auto* ic = static_cast<IfaceCookie*>(cookie);
+            ic->ctx->last_ts = raw->getPacketTimeStamp();
+
+             // ---- 诊断代码（同离线部分） ----
+            pcpp::Packet pkt(raw);
+            auto* ip  = pkt.getLayerOfType<pcpp::IPv4Layer>();
+            auto* tcp = pkt.getLayerOfType<pcpp::TcpLayer>();
+            if (tcp) {
+                bool isSyn = tcp->getTcpHeader()->synFlag;
+                spdlog::debug("[diag实时] TCP {}:{}->{} SYN={} dataLen={}",
+                    ip ? ip->getSrcIPAddress().toString() : "?",
+                    ntohs(tcp->getTcpHeader()->portSrc),
+                    ntohs(tcp->getTcpHeader()->portDst),
+                    isSyn, tcp->getLayerPayloadSize());
+            } else {
+                spdlog::debug("[diag实时] 非TCP包");
+            }
+            // ---- 诊断结束 ----
+
+            ic->reasm->reassemblePacket(raw);
+            spdlog::debug("[conn] 网卡");
+        }, &ic);
 
         std::string line;
         std::getline(std::cin, line);   // 按回车退出
@@ -130,7 +158,27 @@ int main(int argc, char** argv) {
             return 1;
         }
         pcpp::RawPacket raw;
-        while (reader.getNextPacket(raw)) reassembly.reassemblePacket(&raw);
+        while (reader.getNextPacket(raw)) {
+            ctx.last_ts = raw.getPacketTimeStamp();
+            // ---- 诊断代码 ----
+            pcpp::Packet pkt(&raw);
+            auto* ip  = pkt.getLayerOfType<pcpp::IPv4Layer>();
+            auto* tcp = pkt.getLayerOfType<pcpp::TcpLayer>();
+            if (tcp) {
+                auto flags = tcp->getTcpHeader()->headerChecksum; // 只是用来占位
+                bool isSyn = tcp->getTcpHeader()->synFlag;
+                bool hasData = tcp->getLayerPayloadSize() > 0;
+                spdlog::debug("[diag] TCP {}:{}->{} SYN={} dataLen={}",
+                    ip ? ip->getSrcIPAddress().toString() : "?",
+                    ntohs(tcp->getTcpHeader()->portSrc),
+                    ntohs(tcp->getTcpHeader()->portDst),
+                    isSyn, tcp->getLayerPayloadSize());
+            } else {
+                spdlog::debug("[diag] 非TCP包");
+            }
+            // ---- 诊断结束 ----
+            reassembly.reassemblePacket(&raw);
+        }
         reader.close();
     }
 

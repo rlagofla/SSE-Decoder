@@ -276,9 +276,7 @@ inline void emit(const Msg& r, uint32_t outer_seq, uint32_t frame_idx, size_t re
     static bool header_done = false;
     if (!header_done) {
         header_done = true;
-        out << "BizIndex,Channel,SecID,TickTime,Action,"
-               "BuyOrderNO,SellOrderNO,Price,Qty,TradeMoney,BSFlag,"
-               "PMAP,OuterSeq,FrameIdx,RecIdx\n";
+        out << "BizIndex,Channel,SecurityID,TickTime,Type,BuyOrderNO,SellOrderNO,Price,Qty,TradeMoney,TickBSFlag,PMAP,OuterSeq,FrameIdx,RecIdx\n";
     }
 
     out << r.biz_index << ','

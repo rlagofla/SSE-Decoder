@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <ctime>
 #include <limits>
 #include <string>
 #include <utility>
@@ -153,6 +154,15 @@ inline std::string fmtTickTime(uint32_t t) {
     uint32_t hh = t / 1000000;
     char b[16];
     std::snprintf(b, sizeof(b), "%02u:%02u:%02u.%02u", hh, mm, ss, xx);
+    return b;
+}
+
+inline std::string fmtPktTime(const timespec& ts) {
+    time_t sec = ts.tv_sec;
+    struct tm t{};
+    localtime_r(&sec, &t);
+    char b[24];
+    std::snprintf(b, sizeof(b), "%02d:%02d:%02d.%03ld", t.tm_hour, t.tm_min, t.tm_sec, ts.tv_nsec / 1000000L);
     return b;
 }
 
