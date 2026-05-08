@@ -59,7 +59,16 @@ public:
     Context*    ctx = nullptr;
 
     void feed(const uint8_t* data, size_t len) {
-        buf_.insert(buf_.end(), data, data + len);
+        if (kBufCap - wpos_ < len) compact();
+        if (kBufCap - wpos_ < len) {
+            // compact() 后仍不够：说明单帧跨包累积超 1 MB，数据流已错乱
+            spdlog::error("[splitter] {} 缓冲区溢出：已缓存 {} 字节 + 新到 {} 字节 > {} KB，清空重置",
+                stream_tag, wpos_ - rpos_, len, kBufCap >> 10);
+            rpos_ = wpos_ = 0;  // 丢弃全部，等下一个魔数重新同步
+            return;
+        }
+        std::memcpy(buf_ + wpos_, data, len);
+        wpos_ += len;
         drain();
     }
 
@@ -69,76 +78,81 @@ private:
         '8','=','S','T','E','P','.','1','.','0','.','0','\x01'
     };
     static constexpr size_t kMagicLen = 13;
+    static constexpr size_t kBufCap   = 1u << 20;  // 1 MB，远大于单帧上限
 
-    std::vector<uint8_t> buf_;
-    uint32_t             frame_idx_ = 0;
+    uint8_t  buf_[kBufCap];
+    uint32_t frame_idx_ = 0;
+    size_t   rpos_      = 0;   // 已消费到的位置（读指针）
+    size_t   wpos_      = 0;   // 已写入到的位置（写指针）
 
     void drain() {
         while (true) {
-            if (buf_.size() < kMagicLen + 4) return;
+            const uint8_t* base  = buf_ + rpos_;
+            size_t         avail = wpos_ - rpos_;
 
-            size_t idx = scanMagic();
-            if (idx == std::string::npos) {
-                size_t keep = kMagicLen - 1;
-                if (buf_.size() > keep) {
-                    spdlog::warn("[splitter] ts={}, {} 未找到魔数，丢弃 {} 字节", utils::fmtPktTime(ctx->last_ts), stream_tag, buf_.size() - keep);
-                    buf_.erase(buf_.begin(), buf_.end() - keep);
+            // 1. 找帧头
+            auto* p = static_cast<const uint8_t*>(memmem(base, avail, kMagicBytes, kMagicLen));
+            if (!p) {
+                if (avail > kMagicLen - 1) {
+                    spdlog::warn("[splitter] ts={}, {} 未找到魔数，丢弃 {} 字节", utils::fmtPktTime(ctx->last_ts), stream_tag, avail - (kMagicLen - 1));
+                    rpos_ = wpos_ - (kMagicLen - 1);
                 }
                 return;
             }
-            if (idx > 0) {
-                spdlog::warn("[splitter] ts={}, {} 魔数前有 {} 字节无效数据，跳过", utils::fmtPktTime(ctx->last_ts), stream_tag, idx);
-                buf_.erase(buf_.begin(), buf_.begin() + idx);
+            if (p > base) {
+                spdlog::warn("[splitter] ts={}, {} 魔数前有 {} 字节无效数据，跳过", utils::fmtPktTime(ctx->last_ts), stream_tag, p - base);
+                rpos_ += p - base;
+                base = p; avail = wpos_ - rpos_;
             }
-            if (buf_.size() < kMagicLen + 4) return;
 
-            // 魔数后紧跟 "9=<digits>\x01"
-            if (buf_[kMagicLen] != '9' || buf_[kMagicLen + 1] != '=') {
+            // 2. magic 后至少要有 "9=X\x01" 才够解析
+            if (avail < kMagicLen + 4) return;
+
+            // 3. 验证并解析 9=
+            if (base[kMagicLen] != '9' || base[kMagicLen + 1] != '=') {
                 spdlog::warn("[splitter] ts={}, {} magic 后未找到 9= 字段，跳过魔数", utils::fmtPktTime(ctx->last_ts), stream_tag);
-                buf_.erase(buf_.begin(), buf_.begin() + kMagicLen);
+                rpos_ += kMagicLen;
                 continue;
             }
-            size_t soh_pos = kMagicLen + 2;
-            while (soh_pos < buf_.size() && buf_[soh_pos] != '\x01') ++soh_pos;
-            if (soh_pos >= buf_.size()) return; // '\x01' 还未到达
+            auto* soh = static_cast<const uint8_t*>(memchr(base + kMagicLen + 2, '\x01', avail - kMagicLen - 2));
+            if (!soh) return;
 
-            size_t body_length = 0;
-            try {
-                body_length = std::stoul(std::string(
-                    reinterpret_cast<const char*>(buf_.data() + kMagicLen + 2),
-                    soh_pos - (kMagicLen + 2)));
-            } catch (...) {
+            size_t body_len = 0;
+            bool   parse_ok = true;
+            for (auto* q = base + kMagicLen + 2; q < soh; ++q) {
+                if (*q < '0' || *q > '9') { parse_ok = false; break; }
+                body_len = body_len * 10 + (*q - '0');
+            }
+            if (!parse_ok) {
                 spdlog::warn("[splitter] ts={}, {} 9= 字段值解析失败，跳过魔数", utils::fmtPktTime(ctx->last_ts), stream_tag);
-                buf_.erase(buf_.begin(), buf_.begin() + kMagicLen);
+                rpos_ += kMagicLen;
                 continue;
             }
 
-            size_t nine_field_len = soh_pos - kMagicLen + 1; // "9=digits\x01" 的字节数
-            size_t total_len      = kMagicLen + nine_field_len + body_length + 7; // +7 for "10=NNN\x01"
-
-            if (total_len > 16u * 1024u * 1024u) {
-                spdlog::warn("[splitter] ts={}, {} 帧长度异常 total_len={}，跳过魔数", utils::fmtPktTime(ctx->last_ts), stream_tag, total_len);
-                buf_.erase(buf_.begin(), buf_.begin() + kMagicLen);
+            // 4. 判断完整帧是否到齐
+            size_t nine_field_len = static_cast<size_t>(soh + 1 - (base + kMagicLen));
+            size_t total          = kMagicLen + nine_field_len + body_len + 7;
+            if (total > 16u * 1024u * 1024u) {
+                spdlog::warn("[splitter] ts={}, {} 帧长度异常 total_len={}，跳过魔数", utils::fmtPktTime(ctx->last_ts), stream_tag, total);
+                rpos_ += kMagicLen;
                 continue;
             }
-            if (buf_.size() < total_len) {
-                spdlog::debug("[splitter] ts={}, {} 帧数据不完整: need={} have={}，等待", utils::fmtPktTime(ctx->last_ts), stream_tag, total_len, buf_.size());
+            if (avail < total) {
+                spdlog::debug("[splitter] ts={}, {} 帧数据不完整: need={} have={}，等待", utils::fmtPktTime(ctx->last_ts), stream_tag, total, avail);
                 return;
             }
 
-            StepFrame frame = parseStepFrame(buf_.data(), total_len);
+            // 5. 解析并交付
+            StepFrame frame = parseStepFrame(base, total);
             handleFrame(frame);
-            buf_.erase(buf_.begin(), buf_.begin() + total_len);
+            rpos_ += total;
         }
     }
 
-    size_t scanMagic() const {
-        if (buf_.size() < kMagicLen) return std::string::npos;
-        size_t n = buf_.size() - kMagicLen + 1;
-        for (size_t i = 0; i < n; ++i) {
-            if (std::memcmp(buf_.data() + i, kMagicBytes, kMagicLen) == 0) return i;
-        }
-        return std::string::npos;
+    void compact() {
+        std::memmove(buf_, buf_ + rpos_, wpos_ - rpos_);
+        wpos_ -= rpos_;
+        rpos_ = 0;
     }
 
     StepFrame parseStepFrame(const uint8_t* buf, size_t total_len) {
@@ -221,7 +235,7 @@ private:
                     size_t         rec_idx = 0;
                     while (parser.next(rec)) {
                         ua5803::emit(rec, frame.msg_seq_id, frame_idx_, rec_idx++, t.dedup, *t.out);
-                        spdlog::debug("[pipeline] ts={}, emit 成功，TickTime {}", utils::fmtPktTime(ctx->last_ts), rec.tick_time);
+                        spdlog::trace("[pipeline] ts={}, emit 成功，TickTime {}", utils::fmtPktTime(ctx->last_ts), rec.tick_time);
                     }
                     break;
                 }

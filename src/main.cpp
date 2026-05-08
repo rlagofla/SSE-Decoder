@@ -49,7 +49,6 @@ void onTcpData(int8_t, const pcpp::TcpStreamData& data, void* cookie) {
         spdlog::warn("[conn] 收到未跟踪连接的数据 flowKey={}", data.getConnectionData().flowKey);
         return;
     }
-    spdlog::debug("[conn] ts={} {} {} bytes", utils::fmtPktTime(ctx->last_ts), it->second->stream_tag, data.getDataLength());
     it->second->feed(reinterpret_cast<const uint8_t*>(data.getData()), data.getDataLength());
 }
 
