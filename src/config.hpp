@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include <toml.hpp>
+#include <toml++/toml.hpp>
 
 struct TypeConfig {
     uint32_t    category_id;

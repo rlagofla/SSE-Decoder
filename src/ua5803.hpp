@@ -122,7 +122,7 @@ public:
             cursor_ += w;
             if (sid.size() != 6) {
                 spdlog::warn("[ua5803] SecurityID 长度异常: len={} val={} cursor={}",
-                             sid.size(), sid, cursor_);
+                             sid.size(), utils::escapeStr(sid), cursor_);
                 return false;
             }
             last_sec_id_ = std::move(sid);
@@ -151,7 +151,7 @@ public:
             }
             cursor_ += w;
             if (a.size() != 1) {
-                spdlog::warn("[ua5803] Action 长度不是 1: val={} cursor={}", a, cursor_);
+                spdlog::warn("[ua5803] Action 长度不是 1: val={} cursor={}", utils::escapeStr(a), cursor_);
                 return false;
             }
             last_action_ = a[0];
@@ -235,7 +235,7 @@ public:
         if (rec.action != 'S') {
             if (rec.bs_flag != "B" && rec.bs_flag != "S" && rec.bs_flag != "N") {
                 spdlog::warn("[ua5803] BSFlag 非法: val={} action={} biz={}",
-                             rec.bs_flag, rec.action, rec.biz_index);
+                             utils::escapeStr(rec.bs_flag), rec.action, rec.biz_index);
                 return false;
             }
         }

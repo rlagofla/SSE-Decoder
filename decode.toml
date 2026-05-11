@@ -2,7 +2,7 @@
 
 [run]
 mode   = "pcap"              # "pcap" 读文件 | "iface" 监听网卡
-source = "data/output.pcap"   # pcap 文件路径 或 网卡名称（如 "eth0"）
+source = "data/0508/20260508_enp1s0f1np1-2.pcap"   # pcap 文件路径 或 网卡名称（如 "eth0"）
 port   = 9129               # TCP 端口过滤（0 = 不过滤）
 
 [log]
@@ -12,7 +12,7 @@ level = "info"              # trace / debug / info / warn / error
 [[decode]]
 category_id = 9
 msg_type    = 5803
-output      = "out/ua5803-2.csv"
+output      = "out/0508/ua5803-afternoon.csv"
 dedup       = true               # 跨 TCP 流去重（按 channel+biz_index）
 
 # [[decode]]

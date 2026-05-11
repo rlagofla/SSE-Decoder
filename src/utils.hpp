@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <ctime>
 #include <limits>
 #include <string>
@@ -127,6 +128,30 @@ inline InflateStatus rawInflateZipLFH(const uint8_t* body, size_t n, std::vector
 
     inflateEnd(&zs);
     return InflateStatus::Ok;
+}
+
+// ---- 字符串转义（用于 spdlog，防止控制字符破坏终端输出） ----
+
+inline std::string escapeStr(const std::string& s) {
+    std::string r;
+    r.reserve(s.size() * 2);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '\n': r += "\\n";  break;
+            case '\r': r += "\\r";  break;
+            case '\t': r += "\\t";  break;
+            case '\b': r += "\\b";  break;
+            default:
+                if (c < 0x20 || c == 0x7f) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\x%02x", c);
+                    r += buf;
+                } else {
+                    r += char(c);
+                }
+        }
+    }
+    return r;
 }
 
 // ---- 格式化 ----

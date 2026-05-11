@@ -204,12 +204,12 @@ private:
                 } else if (tag == "52") {
                     frame.sending_time = value;
                 } else if (tag == "49" && value != "VDE") {
-                    spdlog::warn("[pipeline] {} SenderCompID 异常: {}", stream_tag, value);
+                    spdlog::warn("[pipeline] {} SenderCompID 异常: {}", stream_tag, utils::escapeStr(value));
                 } else if (tag == "56" && value != "VSS") {
-                    spdlog::warn("[pipeline] {} TargetCompID 异常: {}", stream_tag, value);
+                    spdlog::warn("[pipeline] {} TargetCompID 异常: {}", stream_tag, utils::escapeStr(value));
                 }
             } catch (...) {
-                spdlog::warn("[pipeline] {} tag={} 值解析失败: {}", stream_tag, tag, value);
+                spdlog::warn("[pipeline] {} tag={} 值解析失败: {}", stream_tag, tag, utils::escapeStr(value));
             }
         }
 

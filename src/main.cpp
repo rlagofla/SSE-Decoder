@@ -49,6 +49,8 @@ void onTcpData(int8_t, const pcpp::TcpStreamData& data, void* cookie) {
         spdlog::warn("[conn] 收到未跟踪连接的数据 flowKey={}", data.getConnectionData().flowKey);
         return;
     }
+    if (size_t missing = data.getMissingByteCount(); missing > 0)
+        spdlog::warn("[tcpdata] {} 乱序溢出，丢失 {} 字节，本次交付 {} 字节", it->second->stream_tag, missing, data.getDataLength());
     it->second->feed(reinterpret_cast<const uint8_t*>(data.getData()), data.getDataLength());
 }
 
@@ -106,10 +108,12 @@ int main(int argc, char** argv) {
         spdlog::info("[main] 类型 ({},{}) -> {}", tc.category_id, tc.msg_type, tc.output);
     }
 
-    pcpp::TcpReassembly reassembly(onTcpData, &ctx, onConnStart, onConnEnd);
+    pcpp::TcpReassemblyConfiguration tcpcfg;   
+    tcpcfg.maxOutOfOrderFragments = 64; // 积累 64 个乱序包后放弃等待，强制交付并打 missingByteCount
+    pcpp::TcpReassembly reassembly(onTcpData, &ctx, onConnStart, onConnEnd, tcpcfg);
 
     if (cfg.mode == "iface") {
-        auto* dev = pcpp::PcapLiveDeviceList::getInstance().getPcapLiveDeviceByName(cfg.source);
+        auto* dev = pcpp::PcapLiveDeviceList::getInstance().getDeviceByName(cfg.source);
         if (!dev) {
             spdlog::error("[conn] 找不到网卡: {}", cfg.source);
             return 1;
@@ -166,12 +170,13 @@ int main(int argc, char** argv) {
             if (tcp) {
                 auto flags = tcp->getTcpHeader()->headerChecksum; // 只是用来占位
                 bool isSyn = tcp->getTcpHeader()->synFlag;
+                bool isAck = tcp->getTcpHeader()->ackFlag;
                 bool hasData = tcp->getLayerPayloadSize() > 0;
-                spdlog::debug("[diag] TCP {}:{}->{} SYN={} dataLen={}",
+                spdlog::debug("[diag] TCP {}:{}->{} SYN={} ACK={} dataLen={}",
                     ip ? ip->getSrcIPAddress().toString() : "?",
                     ntohs(tcp->getTcpHeader()->portSrc),
                     ntohs(tcp->getTcpHeader()->portDst),
-                    isSyn, tcp->getLayerPayloadSize());
+                    isSyn, isAck, tcp->getLayerPayloadSize());
             } else {
                 spdlog::debug("[diag] 非TCP包");
             }
