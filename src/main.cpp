@@ -135,18 +135,18 @@ int main(int argc, char** argv) {
             auto* tcp = pkt.getLayerOfType<pcpp::TcpLayer>();
             if (tcp) {
                 bool isSyn = tcp->getTcpHeader()->synFlag;
-                spdlog::debug("[diag实时] TCP {}:{}->{} SYN={} dataLen={}",
+                bool isAck = tcp->getTcpHeader()->ackFlag;
+                spdlog::debug("[diag实时] TCP {}:{}->{} SYN={} ACK={} dataLen={}",
                     ip ? ip->getSrcIPAddress().toString() : "?",
                     ntohs(tcp->getTcpHeader()->portSrc),
                     ntohs(tcp->getTcpHeader()->portDst),
-                    isSyn, tcp->getLayerPayloadSize());
+                    isSyn, isAck, tcp->getLayerPayloadSize());
             } else {
                 spdlog::debug("[diag实时] 非TCP包");
             }
             // ---- 诊断结束 ----
 
             ic->reasm->reassemblePacket(raw);
-            spdlog::debug("[conn] 网卡");
         }, &ic);
 
         std::string line;
