@@ -23,45 +23,28 @@
 
 #include <IPv4Layer.h>
 #include <TcpLayer.h>
-#include <arpa/inet.h>   // ntohs
+#include <arpa/inet.h>
 
-void onConnStart(const pcpp::ConnectionData& c, void* cookie) {
-    auto* ctx = static_cast<Context*>(cookie);
-    if (!utils::portMatch(c, ctx->filter_port)) {
-        spdlog::trace("[conn] 端口不匹配（filter={}），跳过 {}:{} -> {}:{}", ctx->filter_port, c.srcIP.toString(), c.srcPort, c.dstIP.toString(), c.dstPort);
-        return;
-    }
-    auto sp = std::make_unique<Splitter>();
-    sp->ctx = ctx;
-    std::ostringstream ss;
-    ss << c.srcIP.toString() << ":" << c.srcPort
-       << "->" << c.dstIP.toString() << ":" << c.dstPort;
-    sp->stream_tag = ss.str();
-    spdlog::info("[conn] 新连接: {}", sp->stream_tag);
-    ctx->streams[c.flowKey] = std::move(sp);
-}
+struct Cookie {
+    Pipeline*              pl;
+    uint16_t               port;
+    timespec               last_ts{};
+    pcpp::TcpReassembly*   reasm = nullptr;  // iface 模式下填充
+};
 
 void onTcpData(int8_t, const pcpp::TcpStreamData& data, void* cookie) {
-    auto* ctx = static_cast<Context*>(cookie);
-    spdlog::debug("[tcpdata] ts={} flowKey={} len={}", utils::fmtPktTime(ctx->last_ts), data.getConnectionData().flowKey, data.getDataLength());
-    auto  it  = ctx->streams.find(data.getConnectionData().flowKey);
-    if (it == ctx->streams.end()) {
-        spdlog::warn("[conn] 收到未跟踪连接的数据 flowKey={}", data.getConnectionData().flowKey);
-        return;
-    }
+    auto* c = static_cast<Cookie*>(cookie);
+    const auto& conn = data.getConnectionData();
+    if (!utils::portMatch(conn, c->port)) return;
     if (size_t missing = data.getMissingByteCount(); missing > 0)
-        spdlog::warn("[tcpdata] {} 乱序溢出，丢失 {} 字节，本次交付 {} 字节", it->second->stream_tag, missing, data.getDataLength());
-    it->second->feed(reinterpret_cast<const uint8_t*>(data.getData()), data.getDataLength());
-}
-
-void onConnEnd(const pcpp::ConnectionData& c,
-               pcpp::TcpReassembly::ConnectionEndReason reason, void* cookie) {
-    auto* ctx = static_cast<Context*>(cookie);
-    auto  it  = ctx->streams.find(c.flowKey);
-    if (it != ctx->streams.end()) {
-        spdlog::info("[conn] 连接结束: {} reason={}", it->second->stream_tag, static_cast<int>(reason));
-        ctx->streams.erase(it);
-    }
+        spdlog::warn("[reasm] flow={} 丢失 {} 字节, 本次交付 {} 字节",
+                     conn.flowKey, missing, data.getDataLength());
+    char tag[64];
+    std::snprintf(tag, sizeof(tag), "%s:%u->%s:%u",
+        conn.srcIP.toString().c_str(), conn.srcPort,
+        conn.dstIP.toString().c_str(), conn.dstPort);
+    c->pl->OnTcpData(tag, c->last_ts,
+        reinterpret_cast<const uint8_t*>(data.getData()), data.getDataLength());
 }
 
 int main(int argc, char** argv) {
@@ -80,7 +63,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // 设置日志级别
     {
         auto lvl = spdlog::level::info;
         if      (cfg.log_level == "trace") lvl = spdlog::level::trace;
@@ -90,11 +72,8 @@ int main(int argc, char** argv) {
         spdlog::set_level(lvl);
     }
 
-    // 打开各类型的输出文件，构建 Context
-    // ofstreams 在 main 栈上存活，ActiveType 持非拥有指针
     std::vector<std::unique_ptr<std::ofstream>> outfiles;
-    Context ctx;
-    ctx.filter_port = cfg.port;
+    std::vector<ActiveType> types;
 
     for (auto& tc : cfg.types) {
         auto ofs = std::make_unique<std::ofstream>(tc.output);
@@ -102,15 +81,20 @@ int main(int argc, char** argv) {
             spdlog::error("无法打开输出文件: {}", tc.output);
             return 1;
         }
-        ActiveType at{ tc.category_id, tc.msg_type, tc.dedup, ofs.get() };
-        ctx.types.push_back(at);
+        types.push_back({ tc.category_id, tc.msg_type, tc.dedup, ofs.get() });
         outfiles.push_back(std::move(ofs));
         spdlog::info("[main] 类型 ({},{}) -> {}", tc.category_id, tc.msg_type, tc.output);
     }
 
-    pcpp::TcpReassemblyConfiguration tcpcfg;   
-    tcpcfg.maxOutOfOrderFragments = 64; // 积累 64 个乱序包后放弃等待，强制交付并打 missingByteCount
-    pcpp::TcpReassembly reassembly(onTcpData, &ctx, onConnStart, onConnEnd, tcpcfg);
+    Pipeline pipeline;
+    pipeline.ConfigureTypes(std::move(types));
+    pipeline.Start();
+
+    Cookie ck{ &pipeline, cfg.port, {} };
+
+    pcpp::TcpReassemblyConfiguration tcpcfg;
+    tcpcfg.maxOutOfOrderFragments = 64;
+    pcpp::TcpReassembly reassembly(onTcpData, &ck, nullptr, nullptr, tcpcfg);
 
     if (cfg.mode == "iface") {
         auto* dev = pcpp::PcapLiveDeviceList::getInstance().getDeviceByName(cfg.source);
@@ -123,13 +107,12 @@ int main(int argc, char** argv) {
             return 1;
         }
         spdlog::info("[conn] 开始监听网卡: {}", cfg.source);
-        struct IfaceCookie { pcpp::TcpReassembly* reasm; Context* ctx; };
-        IfaceCookie ic{ &reassembly, &ctx };
+        ck.reasm = &reassembly;
         dev->startCapture([](pcpp::RawPacket* raw, pcpp::PcapLiveDevice*, void* cookie) {
-            auto* ic = static_cast<IfaceCookie*>(cookie);
-            ic->ctx->last_ts = raw->getPacketTimeStamp();
+            auto* c = static_cast<Cookie*>(cookie);
+            c->last_ts = raw->getPacketTimeStamp();
 
-             // ---- 诊断代码（同离线部分） ----
+            // ---- 诊断 ----
             pcpp::Packet pkt(raw);
             auto* ip  = pkt.getLayerOfType<pcpp::IPv4Layer>();
             auto* tcp = pkt.getLayerOfType<pcpp::TcpLayer>();
@@ -146,11 +129,11 @@ int main(int argc, char** argv) {
             }
             // ---- 诊断结束 ----
 
-            ic->reasm->reassemblePacket(raw);
-        }, &ic);
+            c->reasm->reassemblePacket(raw);
+        }, &ck);
 
         std::string line;
-        std::getline(std::cin, line);   // 按回车退出
+        std::getline(std::cin, line);
 
         dev->stopCapture();
         dev->close();
@@ -162,16 +145,15 @@ int main(int argc, char** argv) {
         }
         pcpp::RawPacket raw;
         while (reader.getNextPacket(raw)) {
-            ctx.last_ts = raw.getPacketTimeStamp();
-            // ---- 诊断代码 ----
+            ck.last_ts = raw.getPacketTimeStamp();
+
+            // ---- 诊断 ----
             pcpp::Packet pkt(&raw);
             auto* ip  = pkt.getLayerOfType<pcpp::IPv4Layer>();
             auto* tcp = pkt.getLayerOfType<pcpp::TcpLayer>();
             if (tcp) {
-                auto flags = tcp->getTcpHeader()->headerChecksum; // 只是用来占位
                 bool isSyn = tcp->getTcpHeader()->synFlag;
                 bool isAck = tcp->getTcpHeader()->ackFlag;
-                bool hasData = tcp->getLayerPayloadSize() > 0;
                 spdlog::debug("[diag] TCP {}:{}->{} SYN={} ACK={} dataLen={}",
                     ip ? ip->getSrcIPAddress().toString() : "?",
                     ntohs(tcp->getTcpHeader()->portSrc),
@@ -181,11 +163,14 @@ int main(int argc, char** argv) {
                 spdlog::debug("[diag] 非TCP包");
             }
             // ---- 诊断结束 ----
+
             reassembly.reassemblePacket(&raw);
         }
         reader.close();
     }
 
     reassembly.closeAllConnections();
+    pipeline.Drain();
+    pipeline.Stop();
     return 0;
 }
