@@ -25,26 +25,7 @@
 #include <arpa/inet.h>
 #include <csignal>
 
-struct Cookie {
-    Pipeline*  pl;
-    uint16_t   port;
-    timespec   last_ts{};
-};
 
-void onTcpData(int8_t, const pcpp::TcpStreamData& data, void* cookie) {
-    auto* c = static_cast<Cookie*>(cookie);
-    const auto& conn = data.getConnectionData();
-    if (!utils::portMatch(conn, c->port)) return;
-    if (size_t missing = data.getMissingByteCount(); missing > 0)
-        spdlog::warn("[reasm] flow={} 丢失 {} 字节, 本次交付 {} 字节",
-                     conn.flowKey, missing, data.getDataLength());
-    char tag[64];
-    std::snprintf(tag, sizeof(tag), "%s:%u->%s:%u",
-        conn.srcIP.toString().c_str(), conn.srcPort,
-        conn.dstIP.toString().c_str(), conn.dstPort);
-    c->pl->OnTcpData(tag, c->last_ts,
-        reinterpret_cast<const uint8_t*>(data.getData()), data.getDataLength());
-}
 
 int main(int argc, char** argv) {
     spdlog::set_default_logger(spdlog::stderr_color_mt("console"));
@@ -106,12 +87,6 @@ int main(int argc, char** argv) {
         pipeline.Stop();
         return rc;
     } else {
-        Cookie ck{ &pipeline, cfg.port, {} };
-
-        pcpp::TcpReassemblyConfiguration tcpcfg;
-        tcpcfg.maxOutOfOrderFragments = 64;
-        pcpp::TcpReassembly reassembly(onTcpData, &ck, nullptr, nullptr, tcpcfg);
-
         pcpp::PcapFileReaderDevice reader(cfg.source);
         if (!reader.open()) {
             spdlog::error("[conn] 打开 pcap 失败: {}", cfg.source);
@@ -119,30 +94,30 @@ int main(int argc, char** argv) {
         }
         pcpp::RawPacket raw;
         while (reader.getNextPacket(raw)) {
-            ck.last_ts = raw.getPacketTimeStamp();
-
-            // ---- 诊断 ----
             pcpp::Packet pkt(&raw);
             auto* ip  = pkt.getLayerOfType<pcpp::IPv4Layer>();
             auto* tcp = pkt.getLayerOfType<pcpp::TcpLayer>();
-            if (tcp) {
-                bool isSyn = tcp->getTcpHeader()->synFlag;
-                bool isAck = tcp->getTcpHeader()->ackFlag;
-                spdlog::debug("[diag] TCP {}:{}->{} SYN={} ACK={} dataLen={}",
-                    ip ? ip->getSrcIPAddress().toString() : "?",
-                    ntohs(tcp->getTcpHeader()->portSrc),
-                    ntohs(tcp->getTcpHeader()->portDst),
-                    isSyn, isAck, tcp->getLayerPayloadSize());
+            
+            if (tcp && ip) {
+                pcpp::ConnectionData conn;
+                conn.srcIP = ip->getSrcIPAddress();
+                conn.dstIP = ip->getDstIPAddress();
+                conn.srcPort = ntohs(tcp->getTcpHeader()->portSrc);
+                conn.dstPort = ntohs(tcp->getTcpHeader()->portDst);
+                
+                if (utils::portMatch(conn, cfg.port)) {
+                    uint32_t seq = ntohl(tcp->getTcpHeader()->sequenceNumber);
+                    size_t payload_len = tcp->getLayerPayloadSize();
+                    if (payload_len > 0) {
+                        pipeline.OnTcpData(tcp->getLayerPayload(), payload_len, seq);
+                    }
+                }
             } else {
-                spdlog::debug("[diag] 非TCP包");
+                spdlog::debug("[diag] 非IPv4/TCP包");
             }
-            // ---- 诊断结束 ----
-
-            reassembly.reassemblePacket(&raw);
         }
         reader.close();
 
-        reassembly.closeAllConnections();
         pipeline.Drain();
         pipeline.Stop();
         return 0;
