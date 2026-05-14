@@ -11,25 +11,24 @@
 #include <vector>
 
 #include <PcapFileDevice.h>
-#include <PcapLiveDevice.h>
-#include <PcapLiveDeviceList.h>
 #include <Packet.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
 #include "config.hpp"
+#include "live.hpp"
 #include "pipeline.hpp"
 #include "utils.hpp"
 
 #include <IPv4Layer.h>
 #include <TcpLayer.h>
 #include <arpa/inet.h>
+#include <csignal>
 
 struct Cookie {
-    Pipeline*              pl;
-    uint16_t               port;
-    timespec               last_ts{};
-    pcpp::TcpReassembly*   reasm = nullptr;  // iface 模式下填充
+    Pipeline*  pl;
+    uint16_t   port;
+    timespec   last_ts{};
 };
 
 void onTcpData(int8_t, const pcpp::TcpStreamData& data, void* cookie) {
@@ -90,54 +89,29 @@ int main(int argc, char** argv) {
     pipeline.ConfigureTypes(std::move(types));
     pipeline.Start();
 
-    Cookie ck{ &pipeline, cfg.port, {} };
-
-    pcpp::TcpReassemblyConfiguration tcpcfg;
-    tcpcfg.maxOutOfOrderFragments = 64;
-    pcpp::TcpReassembly reassembly(onTcpData, &ck, nullptr, nullptr, tcpcfg);
-
     if (cfg.mode == "iface") {
-        auto* dev = pcpp::PcapLiveDeviceList::getInstance().getDeviceByName(cfg.source);
-        if (!dev) {
-            spdlog::error("[conn] 找不到网卡: {}", cfg.source);
-            return 1;
-        }
-        if (!dev->open()) {
-            spdlog::error("[conn] 打开网卡失败: {}", cfg.source);
-            return 1;
-        }
-        spdlog::info("[conn] 开始监听网卡: {}", cfg.source);
-        ck.reasm = &reassembly;
-        dev->startCapture([](pcpp::RawPacket* raw, pcpp::PcapLiveDevice*, void* cookie) {
-            auto* c = static_cast<Cookie*>(cookie);
-            c->last_ts = raw->getPacketTimeStamp();
+        static std::atomic<bool> g_stop{false};
+        auto sig_handler = [](int) { g_stop.store(true); };
+        std::signal(SIGINT,  sig_handler);
+        std::signal(SIGTERM, sig_handler);
 
-            // ---- 诊断 ----
-            pcpp::Packet pkt(raw);
-            auto* ip  = pkt.getLayerOfType<pcpp::IPv4Layer>();
-            auto* tcp = pkt.getLayerOfType<pcpp::TcpLayer>();
-            if (tcp) {
-                bool isSyn = tcp->getTcpHeader()->synFlag;
-                bool isAck = tcp->getTcpHeader()->ackFlag;
-                spdlog::debug("[diag实时] TCP {}:{}->{} SYN={} ACK={} dataLen={}",
-                    ip ? ip->getSrcIPAddress().toString() : "?",
-                    ntohs(tcp->getTcpHeader()->portSrc),
-                    ntohs(tcp->getTcpHeader()->portDst),
-                    isSyn, isAck, tcp->getLayerPayloadSize());
-            } else {
-                spdlog::debug("[diag实时] 非TCP包");
-            }
-            // ---- 诊断结束 ----
+        cfg.iface.iface = cfg.source;
+        spdlog::info("[iface] 启动 backend={} iface={} bin_dir={}",
+                     cfg.iface.backend, cfg.iface.iface, cfg.iface.bin_dir);
 
-            c->reasm->reassemblePacket(raw);
-        }, &ck);
+        std::string err;
+        int rc = RunIfaceMode(cfg.iface, pipeline, cfg.port, g_stop, &err);
+        if (rc != 0) spdlog::error("[iface] {}", err);
 
-        std::string line;
-        std::getline(std::cin, line);
-
-        dev->stopCapture();
-        dev->close();
+        pipeline.Stop();
+        return rc;
     } else {
+        Cookie ck{ &pipeline, cfg.port, {} };
+
+        pcpp::TcpReassemblyConfiguration tcpcfg;
+        tcpcfg.maxOutOfOrderFragments = 64;
+        pcpp::TcpReassembly reassembly(onTcpData, &ck, nullptr, nullptr, tcpcfg);
+
         pcpp::PcapFileReaderDevice reader(cfg.source);
         if (!reader.open()) {
             spdlog::error("[conn] 打开 pcap 失败: {}", cfg.source);
@@ -167,10 +141,10 @@ int main(int argc, char** argv) {
             reassembly.reassemblePacket(&raw);
         }
         reader.close();
-    }
 
-    reassembly.closeAllConnections();
-    pipeline.Drain();
-    pipeline.Stop();
-    return 0;
+        reassembly.closeAllConnections();
+        pipeline.Drain();
+        pipeline.Stop();
+        return 0;
+    }
 }

@@ -112,7 +112,7 @@ struct Msg {
     bool valid = false;
 };
 
-void print_hex(const uint8_t* body, size_t len) {
+inline void print_hex(const uint8_t* body, size_t len) {
     for (size_t i = 0; i < len; i++) {
         fprintf(stderr, "%02X ", body[i]);
         if ((i + 1) % 16 == 0 && i + 1 < len) {
@@ -122,7 +122,7 @@ void print_hex(const uint8_t* body, size_t len) {
     fputc('\n', stderr);
 }
 
-void print_fast_hex_stderr(const uint8_t* body, size_t len) {
+inline void print_fast_hex_stderr(const uint8_t* body, size_t len) {
     for (size_t i = 0; i < len; i++) {
         fprintf(stderr, "%02X", body[i]);          // 打印当前字节
         if (body[i] & 0x80) {                     // 如果是停止位（bit7=1）

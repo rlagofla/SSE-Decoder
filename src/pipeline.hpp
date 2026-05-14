@@ -380,13 +380,17 @@ class Pipeline {
     std::thread worker_thread_;
     Assembler assembler_;
     std::atomic<size_t> pending_{0};
+    std::vector<std::ostream*> outputs_;
 public:
     Pipeline()
         : pool_(kTcpDataPoolSize),
           queue_(kTcpDataPoolSize),
           assembler_(pool_, queue_, &pending_) {}
 
-    void ConfigureTypes(std::vector<ActiveType> types) { worker_.ConfigureTypes(std::move(types)); }
+    void ConfigureTypes(std::vector<ActiveType> types) {
+        for (auto& t : types) if (t.out) outputs_.push_back(t.out);
+        worker_.ConfigureTypes(std::move(types));
+    }
 
     void Start() {
         worker_thread_ = std::thread([this] { worker_.Run(queue_, pool_, &pending_); });
@@ -394,6 +398,11 @@ public:
 
     void Drain() {
         while (pending_.load(std::memory_order_acquire) != 0) std::this_thread::yield();
+    }
+
+    // 调用方须先 Drain()，确保 Worker idle 后再调用，以避免与 Worker 写 CSV 竞争
+    void FlushOutputs() {
+        for (auto* out : outputs_) out->flush();
     }
 
     void Stop() {
