@@ -160,3 +160,79 @@ int RunIfaceMode(const IfaceConfig& cfg, Pipeline& pipeline, uint16_t port_filte
     reader_thread.join();
     return 0;
 }
+
+int RunBinMode(const IfaceConfig& cfg, Pipeline& pipeline, uint16_t port_filter,
+               std::atomic<bool>& stop, std::string* err_msg) {
+    PinCurrentThreadToCpu(cfg.reader_cpu);
+
+    bin::BinRotateSync sync;
+    sync.write_segment.store(INT32_MAX); // Fake a very large write segment so it tries to read all available files
+    sync.capture_running.store(false);   // We are not capturing live
+
+    const std::string prefix = effectiveBinPrefix(cfg);
+    bin::BinReader rd;
+    rd.AttachRotateSync(&sync);
+
+    std::string open_err;
+    if (!rd.Open(cfg.bin_dir, prefix, &open_err)) {
+        if (err_msg) *err_msg = open_err;
+        return 1;
+    }
+    if (cfg.delete_bin_after_read) rd.SetDeleteSegmentAfterRead(true);
+
+    if (cfg.flush_csv_per_segment) {
+        rd.SetOnSegmentClosed([&](int seg) {
+            pipeline.Drain();
+            pipeline.FlushOutputs();
+            spdlog::info("[bin] seg={} 已刷 CSV", seg);
+        });
+    }
+
+    std::vector<uint8_t> pkt_buf;
+    for (;;) {
+        if (stop.load()) break;
+
+        uint64_t ts_ns;
+        if (!rd.ReadNext(&ts_ns, &pkt_buf)) {
+            if (rd.exhausted()) break;
+            // Sleep slightly if file reading hit an EOF but is trying next file
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+
+        timespec ts;
+        ts.tv_sec  = static_cast<time_t>(ts_ns / 1000000000ULL);
+        ts.tv_nsec = static_cast<long>(ts_ns % 1000000000ULL);
+
+        pcpp::RawPacket raw(pkt_buf.data(), static_cast<int>(pkt_buf.size()),
+                            ts, false, pcpp::LINKTYPE_ETHERNET);
+        
+        pcpp::Packet pkt(&raw);
+        auto* ip  = pkt.getLayerOfType<pcpp::IPv4Layer>();
+        auto* tcp = pkt.getLayerOfType<pcpp::TcpLayer>();
+        
+        if (tcp && ip) {
+            pcpp::ConnectionData conn;
+            conn.srcIP = ip->getSrcIPAddress();
+            conn.dstIP = ip->getDstIPAddress();
+            conn.srcPort = ntohs(tcp->getTcpHeader()->portSrc);
+            conn.dstPort = ntohs(tcp->getTcpHeader()->portDst);
+            
+            if (utils::portMatch(conn, port_filter)) {
+                uint32_t seq = ntohl(tcp->getTcpHeader()->sequenceNumber);
+                size_t payload_len = tcp->getLayerPayloadSize();
+                if (payload_len > 0) {
+                    pipeline.OnTcpData(tcp->getLayerPayload(), payload_len, seq);
+                }
+            }
+        }
+    }
+
+    pipeline.Drain();
+    pipeline.FlushOutputs();
+
+    spdlog::info("[bin] 读取结束，seg={}", rd.ReadSegmentNumber());
+    if (cfg.delete_bin_after_read) rd.CloseAndDeleteCurrentSegment();
+
+    return 0;
+}

@@ -86,6 +86,22 @@ int main(int argc, char** argv) {
 
         pipeline.Stop();
         return rc;
+    } else if (cfg.mode == "bin") {
+        static std::atomic<bool> g_stop{false};
+        auto sig_handler = [](int) { g_stop.store(true); };
+        std::signal(SIGINT,  sig_handler);
+        std::signal(SIGTERM, sig_handler);
+
+        cfg.iface.iface = cfg.source;
+        spdlog::info("[bin] 启动离线解析 bin_dir={} bin_prefix={}",
+                     cfg.iface.bin_dir, cfg.iface.bin_prefix);
+
+        std::string err;
+        int rc = RunBinMode(cfg.iface, pipeline, cfg.port, g_stop, &err);
+        if (rc != 0) spdlog::error("[bin] {}", err);
+
+        pipeline.Stop();
+        return rc;
     } else {
         pcpp::PcapFileReaderDevice reader(cfg.source);
         if (!reader.open()) {
