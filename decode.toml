@@ -8,11 +8,25 @@ port   = 9129               # TCP 端口过滤（0 = 不过滤）
 [log]
 level = "info"              # trace / debug / info / warn / error
 
+[iface]
+backend               = "pcap"         # "pcap" | "efvi"
+bin_dir               = "bin/"
+bin_prefix            = ""              # 空 → cap_<iface>
+segment_bytes         = 268435456       # 256 MiB
+promisc               = true
+snaplen               = 65535
+writer_cpu            = -1              # -1 = 不绑核
+reader_cpu            = -1
+open_max_attempts     = 30
+open_retry_ms         = 2000
+delete_bin_after_read = false
+flush_csv_per_segment = true            # 分卷边界刷 CSV（tail -f 实时可见）
+
 # 每个 [[decode]] 块对应一种消息类型
 [[decode]]
 category_id = 9
 msg_type    = 5803
-output      = "out/0508/ua5803-afternoon.csv"
+output      = "out/0508/ua5803-afternoon-3.csv"
 dedup       = true               # 跨 TCP 流去重（按 channel+biz_index）
 
 # [[decode]]
