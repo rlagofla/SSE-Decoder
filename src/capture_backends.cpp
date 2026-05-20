@@ -11,6 +11,7 @@
 #include <PcapLiveDevice.h>
 #include <PcapLiveDeviceList.h>
 #include <RawPacket.h>
+#include <spdlog/spdlog.h>
 
 namespace capture {
 
@@ -66,6 +67,31 @@ public:
         cookie.stop      = &stop;
         cookie.on_packet = &on_packet;
 
+        std::thread stats_thread([&]() {
+            using Stats = pcpp::IPcapDevice::PcapStats;
+            Stats prev{};
+            bool have_prev = false;
+            while (!stop.load()) {
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                if (stop.load()) break;
+                Stats st{};
+                dev->getStatistics(st);
+                if (have_prev) {
+                    uint64_t d_recv  = st.packetsRecv   - prev.packetsRecv;
+                    uint64_t d_drop  = st.packetsDrop   - prev.packetsDrop;
+                    uint64_t d_ifdrp = st.packetsDropByInterface - prev.packetsDropByInterface;
+                    spdlog::info("[pcap-stats] recv={} drop={} ifdrop={} | +recv={} +drop={} +ifdrop={}",
+                                 st.packetsRecv, st.packetsDrop, st.packetsDropByInterface,
+                                 d_recv, d_drop, d_ifdrp);
+                } else {
+                    spdlog::info("[pcap-stats] recv={} drop={} ifdrop={}",
+                                 st.packetsRecv, st.packetsDrop, st.packetsDropByInterface);
+                }
+                prev = st;
+                have_prev = true;
+            }
+        });
+
         while (!stop.load()) {
             dev->startCaptureBlockingMode(
                 [](pcpp::RawPacket* raw, pcpp::PcapLiveDevice*, void* user) -> bool {
@@ -80,6 +106,12 @@ public:
                 },
                 &cookie, 1.0);
         }
+        if (stats_thread.joinable()) stats_thread.join();
+
+        pcpp::IPcapDevice::PcapStats final_st{};
+        dev->getStatistics(final_st);
+        spdlog::info("[pcap-stats] FINAL recv={} drop={} ifdrop={}",
+                     final_st.packetsRecv, final_st.packetsDrop, final_st.packetsDropByInterface);
 
         dev->close();
         return true;

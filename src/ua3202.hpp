@@ -112,217 +112,92 @@ struct Msg {
     bool valid = false;
 };
 
-inline void print_hex(const uint8_t* body, size_t len) {
-    for (size_t i = 0; i < len; i++) {
-        fprintf(stderr, "%02X ", body[i]);
-        if ((i + 1) % 16 == 0 && i + 1 < len) {
-            fputc('\n', stderr);
-        }
-    }
-    fputc('\n', stderr);
-}
-
-inline void print_fast_hex_stderr(const uint8_t* body, size_t len) {
-    for (size_t i = 0; i < len; i++) {
-        fprintf(stderr, "%02X", body[i]);          // 打印当前字节
-        if (body[i] & 0x80) {                     // 如果是停止位（bit7=1）
-            fputc('\n', stderr);                  // 字段结束，换行
-        } else {
-            fputc(' ', stderr);                   // 字段未结束，输出空格
-        }
-    }
-    // 如果最后一行没有以换行结尾（例如 len==0 或末尾字节停止位本身会换行），确保不重复换行
-    // 这里不需要额外操作，因为停止位字节已经换行了。
-}
-
 class Parser {
 public:
-    Parser(const uint8_t* body, size_t len) : body_(body), len_(len) {}
+    Parser(const uint8_t* body, size_t len) : fr_(body, len) {}
 
     bool next(Msg& rec) {
         rec = Msg{};
-        if (cursor_ >= len_) return false;
+        if (fr_.empty()) return false;
 
-        // print_fast_hex_stderr(body_, len_);
-        // fprintf(stderr, "================================================");
+        // pmap
+        if (!fr_.readNum<utils::FastOp::None>(rec.pmap_raw)) return false;
+        fr_.setPmap(rec.pmap_raw);
 
-        uint64_t bits = 0;
-        size_t   pm_len = 0;
-        if (utils::readFast(body_ + cursor_, len_ - cursor_, bits, pm_len) != utils::Status::Ok) {
-            spdlog::warn("[ua3202] PMAP 读取失败: cursor={} remaining={}", cursor_, len_ - cursor_);
-            return false;
-        }
-        // print_fast_hex_stderr(body_ + cursor_, pm_len);
-        cursor_ += pm_len;
-        rec.pmap_raw = bits;
-        if (pm_len != 7) {
-            spdlog::warn("[ua3202] PMAP 长度异常: pm_len={} cursor={}", pm_len, cursor_);
+        // bit48: TID（期望 3202）
+        if (!fr_.readNum<utils::FastOp::Copy>(48, last_template_id_, rec.template_id)) return false;
+        if (rec.template_id != 3202) {
+            spdlog::warn("[ua3202] TID: 期望 3202, 实际 {}", rec.template_id);
             return false;
         }
 
-        // 读 nullable FAST 整数，pmap bit 为 0 则保持 last_val 不变
-        auto rfn = [&](int bit, auto& last_val) -> bool {
-            if (!(bits & (1ull << bit))) return true;
-            uint64_t v; size_t w;
-            if (utils::readFast(body_ + cursor_, len_ - cursor_, v, w) != utils::Status::Ok) {
-                spdlog::warn("[ua3202] bit{} 读取失败: cursor={}", bit, cursor_);
-                return false;
-            }
-            // print_fast_hex_stderr(body_ + cursor_, w);
-            cursor_ += w;
-            auto [x, is_null] = utils::decNull(v);
-            if (!is_null) last_val = decltype(last_val)(x);
-            return true;
-        };
-        // 读普通 FAST 整数（非 nullable），pmap bit 为 0 则保持 last_val 不变
-        auto rff = [&](int bit, auto& last_val) -> bool {
-            if (!(bits & (1ull << bit))) return true;
-            uint64_t v; size_t w;
-            if (utils::readFast(body_ + cursor_, len_ - cursor_, v, w) != utils::Status::Ok) {
-                spdlog::warn("[ua3202] bit{} 读取失败: cursor={}", bit, cursor_);
-                return false;
-            }
-            // print_fast_hex_stderr(body_ + cursor_, w);
-            cursor_ += w;
-            last_val = decltype(last_val)(v);
-            return true;
-        };
-        // 读 ASCII 字符串字段
-        auto rfa = [&](int bit, std::string& last_val) -> bool {
-            if (!(bits & (1ull << bit))) return true;
-            std::string s; size_t w;
-            if (utils::readAscii(body_ + cursor_, len_ - cursor_, s, w) != utils::Status::Ok) {
-                spdlog::warn("[ua3202] bit{} ASCII 读取失败: cursor={}", bit, cursor_);
-                return false;
-            }
-            // print_fast_hex_stderr(body_ + cursor_, w);
-            cursor_ += w;
-            last_val = std::move(s);
-            return true;
-        };
+        if (!fr_.readNum<utils::FastOp::Copy>(47, last_tick_time_, rec.tick_time)) return false;
+        if (!fr_.readNum<utils::FastOp::Copy>(46, last_data_status_, rec.data_status)) return false;
 
-        // bit48: TID（期望 0x19 0x82 = 3202）
-        if (bits & (1ull << 48)) {
-            if (cursor_ + 2 > len_) {
-                spdlog::warn("[ua3202] TID: buffer 不足: cursor={} len={}", cursor_, len_);
-                return false;
-            }
-            if (body_[cursor_] != 0x19 || body_[cursor_ + 1] != 0x82) {
-                spdlog::warn("[ua3202] TID: 期望 19 82, 实际 {:02x} {:02x}: cursor={}", body_[cursor_], body_[cursor_ + 1], cursor_);
-                return false;
-            }
-            cursor_ += 2;
-            rec.template_id = 3202;
-        }
+        if (!fr_.readString<utils::FastOp::None>(rec.security_id)) return false;
+        if (!fr_.readNum<utils::FastOp::None>(rec.image_status)) return false;
 
-        if (!rff(47, last_tick_time_)) return false; rec.tick_time = last_tick_time_;
-        if (!rff(46, last_data_status_)) return false; rec.data_status = last_data_status_;
-
-        // SecurityID: none 类型，始终存在
-        {
-        size_t w; 
-        if (utils::readAscii(body_ + cursor_, len_ - cursor_, last_sec_id_, w) != utils::Status::Ok) { 
-            spdlog::warn("[ua3202] SecurityID 读取失败: cursor={}", cursor_);
-            return false;
-        } 
-        // print_fast_hex_stderr(body_ + cursor_, w);
-        cursor_ += w;
-        rec.security_id = last_sec_id_;
-        }
-
-        // ImageStatus: none 类型，始终存在，普通 FAST 整数
-        {
-        uint64_t v; size_t w;
-        if (utils::readFast(body_ + cursor_, len_ - cursor_, v, w) != utils::Status::Ok) {
-            spdlog::warn("[ua3202] ImageStatus 读取失败: cursor={}", cursor_); 
-            return false; 
-        } 
-        // print_fast_hex_stderr(body_ + cursor_, w);
-        cursor_ += w; 
-        last_image_status_ = uint32_t(v);
-        rec.image_status = last_image_status_;
-        }
-
-        if (!rfn(45, last_pre_close_px_)) return false; rec.pre_close_px = last_pre_close_px_;
-        if (!rfn(44, last_open_px_)) return false; rec.open_px = last_open_px_;
-        if (!rfn(43, last_high_px_)) return false; rec.high_px = last_high_px_;
-        if (!rfn(42, last_low_px_)) return false; rec.low_px = last_low_px_;
-        if (!rfn(41, last_last_px_)) return false; rec.last_px = last_last_px_;
-        if (!rfn(40, last_close_px_)) return false; rec.close_px = last_close_px_;
-        if (!rfa(39, last_instr_status_)) return false; rec.instrument_status = last_instr_status_;
-        if (!rfa(38, last_trading_phase_)) return false; rec.trading_phase_code = last_trading_phase_;
-        if (!rfn(37, last_num_trades_)) return false; rec.num_trades = last_num_trades_;
-        if (!rfn(36, last_total_volume_)) return false; rec.total_volume = last_total_volume_;
-        if (!rfn(35, last_total_value_)) return false; rec.total_value = last_total_value_;
-        if (!rfn(34, last_total_bid_qty_)) return false; rec.total_bid_qty = last_total_bid_qty_;
-        if (!rfn(33, last_wavg_bid_px_)) return false; rec.wavg_bid_px = last_wavg_bid_px_;
-        if (!rfn(32, last_alt_wavg_bid_px_)) return false; rec.alt_wavg_bid_px = last_alt_wavg_bid_px_;
-        if (!rfn(31, last_total_offer_qty_)) return false; rec.total_offer_qty = last_total_offer_qty_;
-        if (!rfn(30, last_wavg_offer_px_)) return false; rec.wavg_offer_px = last_wavg_offer_px_;
-        if (!rfn(29, last_alt_wavg_offer_px_)) return false; rec.alt_wavg_offer_px = last_alt_wavg_offer_px_;
-        if (!rfn(28, last_iopv_)) return false; rec.iopv = last_iopv_;
-        if (!rfn(27, last_etf_buy_num_)) return false; rec.etf_buy_num = last_etf_buy_num_;
-        if (!rfn(26, last_etf_buy_amount_)) return false; rec.etf_buy_amount = last_etf_buy_amount_;
-        if (!rfn(25, last_etf_buy_money_)) return false; rec.etf_buy_money = last_etf_buy_money_;
-        if (!rfn(24, last_etf_sell_num_)) return false; rec.etf_sell_num = last_etf_sell_num_;
-        if (!rfn(23, last_etf_sell_amount_)) return false; rec.etf_sell_amount = last_etf_sell_amount_;
-        if (!rfn(22, last_etf_sell_money_)) return false; rec.etf_sell_money = last_etf_sell_money_;
-        if (!rfn(21, last_ytm_)) return false; rec.ytm = last_ytm_;
-        if (!rfn(20, last_total_warrant_exec_qty_)) return false; rec.total_warrant_exec_qty = last_total_warrant_exec_qty_;
-        if (!rfn(19, last_war_lower_px_)) return false; rec.war_lower_px = last_war_lower_px_;
-        if (!rfn(18, last_war_upper_px_)) return false; rec.war_upper_px = last_war_upper_px_;
-        if (!rfn(17, last_withdraw_buy_num_)) return false; rec.withdraw_buy_num = last_withdraw_buy_num_;
-        if (!rfn(16, last_withdraw_buy_amount_)) return false; rec.withdraw_buy_amount = last_withdraw_buy_amount_;
-        if (!rfn(15, last_withdraw_buy_money_)) return false; rec.withdraw_buy_money = last_withdraw_buy_money_;
-        if (!rfn(14, last_withdraw_sell_num_)) return false; rec.withdraw_sell_num = last_withdraw_sell_num_;
-        if (!rfn(13, last_withdraw_sell_amount_)) return false; rec.withdraw_sell_amount = last_withdraw_sell_amount_;
-        if (!rfn(12, last_withdraw_sell_money_)) return false; rec.withdraw_sell_money = last_withdraw_sell_money_;
-        if (!rfn(11, last_total_bid_num_)) return false; rec.total_bid_num = last_total_bid_num_;
-        if (!rfn(10, last_total_offer_num_)) return false; rec.total_offer_num = last_total_offer_num_;
-        if (!rfn(9,  last_bid_trade_max_dur_)) return false; rec.bid_trade_max_dur = last_bid_trade_max_dur_;
-        if (!rfn(8,  last_offer_trade_max_dur_)) return false; rec.offer_trade_max_dur = last_offer_trade_max_dur_;
-        if (!rfn(7,  last_num_bid_orders_)) return false; rec.num_bid_orders = last_num_bid_orders_;
-        if (!rfn(6,  last_num_offer_orders_)) return false; rec.num_offer_orders = last_num_offer_orders_;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(45, last_pre_close_px_, rec.pre_close_px)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(44, last_open_px_, rec.open_px)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(43, last_high_px_, rec.high_px)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(42, last_low_px_, rec.low_px)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(41, last_last_px_, rec.last_px)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(40, last_close_px_, rec.close_px)) return false;
+        if (!fr_.readString<utils::FastOp::Copy>(39, last_instr_status_, rec.instrument_status)) return false;
+        if (!fr_.readString<utils::FastOp::Copy>(38, last_trading_phase_, rec.trading_phase_code)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(37, last_num_trades_, rec.num_trades)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(36, last_total_volume_, rec.total_volume)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(35, last_total_value_, rec.total_value)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(34, last_total_bid_qty_, rec.total_bid_qty)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(33, last_wavg_bid_px_, rec.wavg_bid_px)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(32, last_alt_wavg_bid_px_, rec.alt_wavg_bid_px)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(31, last_total_offer_qty_, rec.total_offer_qty)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(30, last_wavg_offer_px_, rec.wavg_offer_px)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(29, last_alt_wavg_offer_px_, rec.alt_wavg_offer_px)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(28, last_iopv_, rec.iopv)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(27, last_etf_buy_num_, rec.etf_buy_num)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(26, last_etf_buy_amount_, rec.etf_buy_amount)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(25, last_etf_buy_money_, rec.etf_buy_money)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(24, last_etf_sell_num_, rec.etf_sell_num)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(23, last_etf_sell_amount_, rec.etf_sell_amount)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(22, last_etf_sell_money_, rec.etf_sell_money)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(21, last_ytm_, rec.ytm)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(20, last_total_warrant_exec_qty_, rec.total_warrant_exec_qty)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(19, last_war_lower_px_, rec.war_lower_px)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(18, last_war_upper_px_, rec.war_upper_px)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(17, last_withdraw_buy_num_, rec.withdraw_buy_num)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(16, last_withdraw_buy_amount_, rec.withdraw_buy_amount)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(15, last_withdraw_buy_money_, rec.withdraw_buy_money)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(14, last_withdraw_sell_num_, rec.withdraw_sell_num)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(13, last_withdraw_sell_amount_, rec.withdraw_sell_amount)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(12, last_withdraw_sell_money_, rec.withdraw_sell_money)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(11, last_total_bid_num_, rec.total_bid_num)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(10, last_total_offer_num_, rec.total_offer_num)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(9,  last_bid_trade_max_dur_, rec.bid_trade_max_dur)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(8,  last_offer_trade_max_dur_, rec.offer_trade_max_dur)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(7,  last_num_bid_orders_, rec.num_bid_orders)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(6,  last_num_offer_orders_, rec.num_offer_orders)) return false;
 
         // NoBidLevel: none 类型，始终存在
-        {
-        uint64_t n; size_t w; 
-        if (utils::readFast(body_ + cursor_, len_ - cursor_, n, w) != utils::Status::Ok) { 
-            spdlog::warn("[ua3202] NoBidLevel 读取失败: cursor={}", cursor_); 
-            return false;
-        } 
-        // print_fast_hex_stderr(body_ + cursor_, w);
-        cursor_ += w; 
-        auto [x, is_null] = utils::decNull(n);
-        if (!readLevels(x, rec.bid_levels, "bid")) return false;
-        }
+        uint64_t no_bid;
+        if (!fr_.readNum<utils::FastOp::NoneNull>(no_bid)) return false;
+        if (!readLevels(no_bid, rec.bid_levels, "bid")) return false;
 
         // NoOfferLevel: none 类型，始终存在
-        {
-        uint64_t n; size_t w; 
-        if (utils::readFast(body_ + cursor_, len_ - cursor_, n, w) != utils::Status::Ok) {
-            spdlog::warn("[ua3202] NoOfferLevel 读取失败: cursor={}", cursor_); 
-            return false; 
-        } 
-        // print_fast_hex_stderr(body_ + cursor_, w);
-        cursor_ += w; 
-        auto [x, is_null] = utils::decNull(n);
-        if (!readLevels(x, rec.offer_levels, "offer")) return false;
-        }
+        uint64_t no_offer;
+        if (!fr_.readNum<utils::FastOp::NoneNull>(no_offer)) return false;
+        if (!readLevels(no_offer, rec.offer_levels, "offer")) return false;
 
         rec.valid = true;
         return true;
     }
 
 private:
-    const uint8_t* body_;
-    size_t         len_;
-    size_t         cursor_ = 0;
+    utils::FastReader fr_;
 
+    uint64_t    last_template_id_            = 0;
     uint32_t    last_tick_time_              = 0;
     uint32_t    last_data_status_            = 0;
-    std::string last_sec_id_;
-    uint32_t    last_image_status_           = 0;
     int64_t     last_pre_close_px_           = 0;
     int64_t     last_open_px_                = 0;
     int64_t     last_high_px_                = 0;
@@ -365,76 +240,35 @@ private:
     uint32_t    last_num_offer_orders_       = 0;
 
     bool readLevels(uint64_t n, std::vector<PriceLevel>& levels, const char* side) {
-        fprintf(stderr, "n=%d\n", n);
         levels.resize(n);
         int64_t  last_price      = 0;
         int64_t  last_qty        = 0;
-        uint64_t last_num_orders = 0;
+        uint32_t last_num_orders = 0;
         for (uint64_t i = 0; i < n; ++i) {
-            uint64_t sbits = 0; size_t spm;
-            if (utils::readFast(body_ + cursor_, len_ - cursor_, sbits, spm) != utils::Status::Ok) {
-                spdlog::warn("[ua3202] {} level[{}] sub-PMAP 读取失败: cursor={}", side, i, cursor_);
-                return false;
-            }
-            // print_fast_hex_stderr(body_ + cursor_, spm);
-            cursor_ += spm;
-            if (spm != 1) {
-                spdlog::warn("[ua3202] {} level[{}] sub-PMAP 长度异常: spm={}", side, i, spm);
-                return false;
-            }
-            if (sbits & (1ull << 6)) { spdlog::warn("[ua3202] {} level[{}] PriceLevelOperator 不应出现", side, i); return false; }
+            uint64_t sbits = 0;
+            if (!fr_.readNum<utils::FastOp::None>(sbits)) return false;
+            fr_.setPmap(sbits);
 
-            auto rfns = [&](int bit, auto& lv) -> bool {
-                if (!(sbits & (1ull << bit))) return true;
-                uint64_t v; size_t w;
-                if (utils::readFast(body_ + cursor_, len_ - cursor_, v, w) != utils::Status::Ok) {
-                    spdlog::warn("[ua3202] {} level[{}] sub-bit{} 读取失败: cursor={}", side, i, bit, cursor_);
-                    return false;
-                }
-                // print_fast_hex_stderr(body_ + cursor_, w);
-                cursor_ += w;
-                auto [x, is_null] = utils::decNull(v);
-                if (!is_null) lv = decltype(lv)(x);
-                return true;
-            };
+            if (fr_.hasBit(6)) { spdlog::warn("[ua3202] {} level[{}] PriceLevelOperator 不应出现", side, i); return false; }
 
-            if (!rfns(5, last_price)) return false; levels[i].price = last_price;
-            if (!rfns(4, last_qty)) return false; levels[i].qty = last_qty;
-            if (!rfns(3, last_num_orders)) return false; levels[i].num_orders = uint32_t(last_num_orders);
+            if (!fr_.readNum<utils::FastOp::CopyNull>(5, last_price, levels[i].price)) return false;
+            if (!fr_.readNum<utils::FastOp::CopyNull>(4, last_qty, levels[i].qty)) return false;
+            if (!fr_.readNum<utils::FastOp::CopyNull>(3, last_num_orders, levels[i].num_orders)) return false;
 
-            // Orders: none 类型，始终存在
-            uint64_t n_orders; size_t ow;
-            if (utils::readFast(body_ + cursor_, len_ - cursor_, n_orders, ow) != utils::Status::Ok) {
-                spdlog::warn("[ua3202] {} level[{}] Orders count 读取失败: cursor={}", side, i, cursor_);
-                return false;
-            }
-            // print_fast_hex_stderr(body_ + cursor_, ow);
-            cursor_ += ow;
-            auto [x, is_null] = utils::decNull(n_orders);
-            levels[i].orders.resize(x);
+            uint64_t n_orders;
+            if (!fr_.readNum<utils::FastOp::NoneNull>(n_orders)) return false;
+            levels[i].orders.resize(n_orders);
+            
             int64_t last_oqty = 0;
-            for (uint64_t j = 0; j < x; ++j) {
-                uint64_t obits = 0; size_t opm;
-                if (utils::readFast(body_ + cursor_, len_ - cursor_, obits, opm) != utils::Status::Ok) {
-                    spdlog::warn("[ua3202] {} level[{}] order[{}] sub-PMAP 读取失败: cursor={}", side, i, j, cursor_);
-                    return false;
-                }
-                // print_fast_hex_stderr(body_ + cursor_, opm);
-                cursor_ += opm;
-                if (obits & (1ull << 6)) { spdlog::warn("[ua3202] {} level[{}] order[{}] OrderQueueOperator 不应出现", side, i, j); return false; }
-                if (obits & (1ull << 5)) { spdlog::warn("[ua3202] {} level[{}] order[{}] OrderQueueOperatorEntryID 不应出现", side, i, j); return false; }
-                if (obits & (1ull << 4)) {
-                    uint64_t v; size_t w;
-                    if (utils::readFast(body_ + cursor_, len_ - cursor_, v, w) != utils::Status::Ok) {
-                        spdlog::warn("[ua3202] {} level[{}] order[{}] OrderQty 读取失败: cursor={}", side, i, j, cursor_);
-                        return false;
-                    }
-                    // print_fast_hex_stderr(body_ + cursor_, w);
-                    cursor_ += w;
-                    auto [x, is_null] = utils::decNull(v);
-                    if (!is_null) last_oqty = int64_t(x);
-                }
-                levels[i].orders[j] = last_oqty;
+            for (uint64_t j = 0; j < n_orders; ++j) {
+                uint64_t obits = 0;
+                if (!fr_.readNum<utils::FastOp::None>(obits)) return false;
+                fr_.setPmap(obits);
+
+                if (fr_.hasBit(6)) { spdlog::warn("[ua3202] {} level[{}] order[{}] OrderQueueOperator 不应出现", side, i, j); return false; }
+                if (fr_.hasBit(5)) { spdlog::warn("[ua3202] {} level[{}] order[{}] OrderQueueOperatorEntryID 不应出现", side, i, j); return false; }
+
+                if (!fr_.readNum<utils::FastOp::CopyNull>(4, last_oqty, levels[i].orders[j])) return false;
             }
         }
         return true;
@@ -464,7 +298,7 @@ inline void emit(const Msg& r, uint32_t outer_seq, uint32_t frame_idx, size_t re
                "TotalBidNum,TotalOfferNum,BidMaxDur,OfferMaxDur,NumBidOrd,NumOfferOrd,";
         for (int i = 1; i <= 10; ++i) out << "BidPx" << i << ",BidQty" << i << ",";
         for (int i = 1; i <= 10; ++i) out << "OfferPx" << i << ",OfferQty" << i << ",";
-        out << "PMAP,OuterSeq,FrameIdx,RecIdx\n";
+        out << "OuterSeq,FrameIdx,RecIdx\n";
     }
 
     // 价格字段精度待确认（此处以 ×10000 输出，即 4 位小数）
@@ -500,9 +334,7 @@ inline void emit(const Msg& r, uint32_t outer_seq, uint32_t frame_idx, size_t re
         else out << "0,0,";
     }
 
-    out << "0x" << std::hex << std::setw(16) << std::setfill('0') << r.pmap_raw
-        << std::dec << std::setfill(' ') << ','
-        << outer_seq << ',' << frame_idx << ',' << rec_idx << '\n';
+    out << outer_seq << ',' << frame_idx << ',' << rec_idx << '\n';
 }
 
 }  // namespace ua3202

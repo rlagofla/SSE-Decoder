@@ -17,117 +17,125 @@ namespace utils {
 
 // ---- FAST 协议底层 ----
 
-enum class Status {
-    Ok,
-    InsufficientBytes,
-    InvalidEncoding,
+// FAST 操作算子
+enum class FastOp {
+    None,         // 无 PMAP 控制，直接读取
+    NoneNull,     // 无 PMAP 控制，直接读取 (Nullable)
+    Copy,         // PMAP=0: 字典; PMAP=1: 读取更新字典
+    CopyNull,     // PMAP=0: 字典; PMAP=1: 读取 Nullable (非 Null 更新字典)
+    Inc,          // PMAP=0: 字典+1; PMAP=1: 读取更新字典
+    DefaultNull   // PMAP=0: 返回 0; PMAP=1: 读取 Nullable (Null 返回 0)，无字典
 };
 
-// stop-bit 变长无符号整数解码
-inline Status readFast(const uint8_t* p, size_t n, uint64_t& out, size_t& consumed) {
-    out = 0; consumed = 0;
-    if (n == 0) return Status::InsufficientBytes;
-    uint64_t v = 0;
-    for (size_t i = 0; i < n; ++i) {
-        v = (v << 7) | uint64_t(p[i] & 0x7F);
-        if (p[i] & 0x80) {
-            out = v; consumed = i + 1;
-            return Status::Ok;
+class FastReader {
+public:
+    FastReader(const uint8_t* body, size_t len) : body_(body), len_(len) {}
+
+    size_t cursor() const { return cursor_; }
+    bool empty() const { return cursor_ >= len_; }
+    void skip(size_t n) { cursor_ += n; }
+
+    void setPmap(uint64_t pmap) { pmap_ = pmap; }
+    bool hasBit(int bit) const { return (pmap_ & (1ull << bit)) != 0; }
+
+    template <FastOp Op, typename T>
+    bool readNum(int bit, T& dict_val, T& out) {
+        if constexpr (Op == FastOp::Copy) {
+            if (!hasBit(bit)) { out = dict_val; return true; }
+            uint64_t v; if (!_readUint(v)) return false;
+            dict_val = static_cast<T>(v);
+            out = dict_val; return true;
+        } 
+        else if constexpr (Op == FastOp::CopyNull) {
+            if (!hasBit(bit)) { out = dict_val; return true; }
+            uint64_t v; if (!_readUint(v)) return false;
+            if (v == 0) { out = 0; return true; }
+            dict_val = static_cast<T>(v - 1);
+            out = dict_val; return true;
         }
+        else if constexpr (Op == FastOp::Inc) {
+            if (!hasBit(bit)) { ++dict_val; out = dict_val; return true; }
+            uint64_t v; if (!_readUint(v)) return false;
+            dict_val = static_cast<T>(v);
+            out = dict_val; return true;
+        }
+        return false;
     }
-    return Status::InsufficientBytes;
-}
 
-// stop-bit ASCII 读取（SecurityID、TradingPhaseCode 等任意长度字段）
-inline Status readAscii(const uint8_t* p, size_t n, std::string& out, size_t& consumed) {
-    out.clear(); consumed = 0;
-    if (n == 0) return Status::InsufficientBytes;
-    for (size_t i = 0; i < n; ++i) {
-        out.push_back(char(p[i] & 0x7F));
-        consumed = i + 1;
-        if (p[i] & 0x80) return Status::Ok;
+    template <FastOp Op, typename T>
+    bool readNum(int bit, T& out) {
+        if constexpr (Op == FastOp::DefaultNull) {
+            if (!hasBit(bit)) { out = 0; return true; }
+            uint64_t v; if (!_readUint(v)) return false;
+            out = (v == 0) ? 0 : static_cast<T>(v - 1); return true;
+        }
+        return false;
     }
-    return Status::InsufficientBytes;
-}
 
-// nullable 解码: V==0 → NULL {0, true}, V>0 → {V-1, false}
-inline std::pair<uint64_t, bool> decNull(uint64_t enc) {
-    if (enc == 0) return {0, true};
-    return {enc - 1, false};
-}
+    template <FastOp Op, typename T>
+    bool readNum(T& out) {
+        if constexpr (Op == FastOp::None) {
+            uint64_t v; if (!_readUint(v)) return false;
+            out = static_cast<T>(v); return true;
+        }
+        else if constexpr (Op == FastOp::NoneNull) {
+            uint64_t v; if (!_readUint(v)) return false;
+            out = (v == 0) ? 0 : static_cast<T>(v - 1); return true;
+        }
+        return false;
+    }
+
+    template <FastOp Op>
+    bool readString(int bit, std::string& dict_val, std::string& out) {
+        if constexpr (Op == FastOp::Copy) {
+            if (!hasBit(bit)) { out = dict_val; return true; }
+            if (!_readString(dict_val)) return false;
+            out = dict_val; return true;
+        }
+        return false;
+    }
+
+    template <FastOp Op>
+    bool readString(std::string& out) {
+        if constexpr (Op == FastOp::None) {
+            return _readString(out);
+        }
+        return false;
+    }
+
+private:
+    bool _readUint(uint64_t& out) {
+        out = 0;
+        uint64_t v = 0;
+        while (cursor_ < len_) {
+            uint8_t b = body_[cursor_++];
+            v = (v << 7) | (b & 0x7F);
+            if (b & 0x80) { out = v; return true; }
+        }
+        return false;
+    }
+
+    bool _readString(std::string& out) {
+        out.clear();
+        while (cursor_ < len_) {
+            uint8_t b = body_[cursor_++];
+            out.push_back(char(b & 0x7F));
+            if (b & 0x80) return true;
+        }
+        return false;
+    }
+
+    const uint8_t* body_;
+    size_t len_;
+    size_t cursor_ = 0;
+    uint64_t pmap_ = 0;
+};
 
 // ---- 二进制读取 ----
 
 inline uint32_t readBE32(const uint8_t* p) {
     return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) |
            (uint32_t(p[2]) <<  8) |  uint32_t(p[3]);
-}
-
-// ---- inflate ----
-
-enum class InflateStatus {
-    Ok,
-    BadMagic,
-    BadMethod,
-    OffsetOverflow,
-    SizeOverflow,
-    InitFailed,
-    DataError,
-    NoProgress,
-};
-
-inline const char* zipStatusStr(InflateStatus s) {
-    static constexpr const char* t[] = {"Ok","BadMagic","BadMethod","OffsetOverflow","SizeOverflow","InitFailed","DataError","NoProgress"};
-    return t[static_cast<int>(s)];
-}
-
-inline InflateStatus rawInflateZipLFH(const uint8_t* body, size_t n, std::vector<uint8_t>& out) {
-    if (n < 30 || body[0] != 'P' || body[1] != 'K' || body[2] != 3 || body[3] != 4)
-        return InflateStatus::BadMagic;
-
-    uint16_t method = uint16_t(body[8]) | (uint16_t(body[9]) << 8);
-    if (method != 8) return InflateStatus::BadMethod;
-
-    uint16_t name_len  = uint16_t(body[26]) | (uint16_t(body[27]) << 8);
-    uint16_t extra_len = uint16_t(body[28]) | (uint16_t(body[29]) << 8);
-    size_t   start     = 30u + name_len + extra_len;
-    if (start >= n) return InflateStatus::OffsetOverflow;
-
-    size_t compressed_size = n - start;
-    if (compressed_size > std::numeric_limits<uInt>::max()) return InflateStatus::SizeOverflow;
-
-    z_stream zs{};
-    if (inflateInit2(&zs, -MAX_WBITS) != Z_OK) return InflateStatus::InitFailed;
-
-    zs.next_in  = const_cast<Bytef*>(body + start);
-    zs.avail_in = uInt(compressed_size);
-
-    out.clear();
-    std::vector<uint8_t> buf(64 * 1024);
-    int ret;
-    do {
-        zs.next_out  = buf.data();
-        zs.avail_out = uInt(buf.size());
-
-        uInt before_in  = zs.avail_in;
-        uInt before_out = zs.avail_out;
-
-        ret = ::inflate(&zs, Z_NO_FLUSH);
-
-        if (ret != Z_OK && ret != Z_STREAM_END) {
-            inflateEnd(&zs);
-            return InflateStatus::DataError;
-        }
-        if (zs.avail_in == before_in && zs.avail_out == before_out) {
-            inflateEnd(&zs);
-            return InflateStatus::NoProgress;
-        }
-
-        out.insert(out.end(), buf.data(), buf.data() + (buf.size() - zs.avail_out));
-    } while (ret != Z_STREAM_END);
-
-    inflateEnd(&zs);
-    return InflateStatus::Ok;
 }
 
 // ---- 字符串转义（用于 spdlog，防止控制字符破坏终端输出） ----
