@@ -239,32 +239,30 @@ inline void emit(const Msg& r, uint32_t outer_seq, const std::string& local_time
     static bool header_done = false;
     if (!header_done) {
         header_done = true;
-        out << "SecID,TickTime,DataStatus,ImageStatus,InstrStatus,Phase,"
-               "PreClose,Open,High,Low,Last,Close,"
+        out << "TickTime,SecID,ImageStatus,"
+               "PreClose,Open,High,Low,Last,Close,InstrStatus,"
                "NumTrades,TotalVol,TotalVal,"
                "TotalBidQty,WAvgBidPx,AltWAvgBidPx,"
                "TotalOfferQty,WAvgOfferPx,AltWAvgOfferPx,"
-               "IOPV,ETFBuyNum,ETFBuyAmt,ETFBuyMoney,ETFSellNum,ETFSellAmt,ETFSellMoney,"
+               "ETFBuyNum,ETFBuyAmt,ETFBuyMoney,ETFSellNum,ETFSellAmt,ETFSellMoney,"
                "YTM,WarrantExecQty,WarLow,WarHigh,"
                "WdBuyNum,WdBuyAmt,WdBuyMoney,WdSellNum,WdSellAmt,WdSellMoney,"
-               "TotalBidNum,TotalOfferNum,BidMaxDur,OfferMaxDur,NumBidOrd,NumOfferOrd,";
-        for (int i = 1; i <= 10; ++i) out << "BidPx" << i << ",BidQty" << i << ",";
+               "TotalBidNum,TotalOfferNum,BidMaxDur,OfferMaxDur,NumBidOrd,NumOfferOrd,IOPV,DataStatus,Phase,";
         for (int i = 1; i <= 10; ++i) out << "OfferPx" << i << ",OfferQty" << i << ",";
+        for (int i = 1; i <= 10; ++i) out << "BidPx" << i << ",BidQty" << i << ",";
         out << "LocalTime,RecIdx,OuterSeq\n";
     }
 
-    out << r.security_id << ','
-        << utils::fmtSnapTime(r.tick_time) << ','
-        << r.data_status << ','
+    out << utils::fmtSnapTime(r.tick_time) << ','
+        << r.security_id << ','
         << r.image_status << ','
-        << (r.instrument_status.empty() ? "?" : r.instrument_status) << ','
-        << (r.trading_phase_code.empty() ? "?" : r.trading_phase_code) << ','
         << utils::fmtDecFixed(r.pre_close_px, 3) << ',' 
         << utils::fmtDecFixed(r.open_px, 3) << ',' 
         << utils::fmtDecFixed(r.high_px, 3) << ','
         << utils::fmtDecFixed(r.low_px, 3) << ',' 
         << utils::fmtDecFixed(r.last_px, 3) << ',' 
         << utils::fmtDecFixed(r.close_px, 3) << ','
+        << (r.instrument_status.empty() ? "?" : r.instrument_status) << ','
         << r.num_trades << ',' 
         << utils::fmtDecFixed(r.total_volume, 3) << ',' 
         << utils::fmtDecFixed(r.total_value, 5) << ','
@@ -274,7 +272,6 @@ inline void emit(const Msg& r, uint32_t outer_seq, const std::string& local_time
         << utils::fmtDecFixed(r.total_offer_qty, 3) << ',' 
         << utils::fmtDecFixed(r.wavg_offer_px, 3) << ',' 
         << utils::fmtDecFixed(r.alt_wavg_offer_px, 3) << ','
-        << utils::fmtDecFixed(r.iopv, 3) << ','
         << r.etf_buy_num << ',' << r.etf_buy_amount << ',' << r.etf_buy_money << ','
         << r.etf_sell_num << ',' << r.etf_sell_amount << ',' << r.etf_sell_money << ','
         << utils::fmtDecFixed(r.ytm, 3) << ',' 
@@ -289,18 +286,22 @@ inline void emit(const Msg& r, uint32_t outer_seq, const std::string& local_time
         << utils::fmtDecFixed(r.withdraw_sell_money, 5) << ','
         << r.total_bid_num << ',' << r.total_offer_num << ','
         << r.bid_trade_max_dur << ',' << r.offer_trade_max_dur << ','
-        << r.num_bid_orders << ',' << r.num_offer_orders << ',';
-
-    for (int i = 0; i < 10; ++i) {
-        if (i < (int)r.bid_levels.size()) 
-            out << utils::fmtDecFixed(r.bid_levels[i].price, 3) << ',' 
-                << utils::fmtDecFixed(r.bid_levels[i].qty, 3) << ',';
-        else out << "0,0,";
-    }
+        << r.num_bid_orders << ',' << r.num_offer_orders << ','
+        << utils::fmtDecFixed(r.iopv, 3) << ','
+        << r.data_status << ','
+        << (r.trading_phase_code.empty() ? "?" : r.trading_phase_code) << ',';
+      
+        
     for (int i = 0; i < 10; ++i) {
         if (i < (int)r.offer_levels.size()) 
             out << utils::fmtDecFixed(r.offer_levels[i].price, 3) << ',' 
                 << utils::fmtDecFixed(r.offer_levels[i].qty, 3) << ',';
+        else out << "0,0,";
+    }
+    for (int i = 0; i < 10; ++i) {
+        if (i < (int)r.bid_levels.size()) 
+            out << utils::fmtDecFixed(r.bid_levels[i].price, 3) << ',' 
+                << utils::fmtDecFixed(r.bid_levels[i].qty, 3) << ',';
         else out << "0,0,";
     }
 
