@@ -103,9 +103,14 @@ int main(int argc, char** argv) {
         pipeline.Stop();
         return rc;
     } else {
-        pcpp::PcapFileReaderDevice reader(cfg.source);
+        std::string pcap_path = cfg.source;
+        if (pcap_path.size() < 5 || pcap_path.compare(pcap_path.size() - 5, 5, ".pcap") != 0) {
+            pcap_path += ".pcap";
+        }
+
+        pcpp::PcapFileReaderDevice reader(pcap_path);
         if (!reader.open()) {
-            spdlog::error("[conn] 打开 pcap 失败: {}", cfg.source);
+            spdlog::error("[conn] 打开 pcap 失败: {}", pcap_path);
             return 1;
         }
         pcpp::RawPacket raw;
