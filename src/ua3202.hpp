@@ -109,7 +109,6 @@ struct Msg {
     uint32_t    num_offer_orders      = 0;
     std::vector<PriceLevel> bid_levels;
     std::vector<PriceLevel> offer_levels;
-    bool valid = false;
 };
 
 class Parser {
@@ -188,7 +187,6 @@ public:
         if (!fr_.readNum<utils::FastOp::NoneNull>(no_offer)) return false;
         if (!readLevels(no_offer, rec.offer_levels, "offer")) return false;
 
-        rec.valid = true;
         return true;
     }
 
@@ -278,7 +276,7 @@ private:
 // 跨 TCP 流去重: key = security_id + "|" + tick_time
 inline std::unordered_set<std::string> g_seen;
 
-inline void emit(const Msg& r, uint32_t outer_seq, uint32_t frame_idx, size_t rec_idx, bool dedup, std::ostream& out) {
+inline void emit(const Msg& r, uint32_t outer_seq, const std::string& local_time, uint64_t rec_idx, bool dedup, std::ostream& out) {
     if (dedup) {
         std::string key = r.security_id + "|" + std::to_string(r.tick_time);
         if (!g_seen.insert(key).second) return;
@@ -298,7 +296,7 @@ inline void emit(const Msg& r, uint32_t outer_seq, uint32_t frame_idx, size_t re
                "TotalBidNum,TotalOfferNum,BidMaxDur,OfferMaxDur,NumBidOrd,NumOfferOrd,";
         for (int i = 1; i <= 10; ++i) out << "BidPx" << i << ",BidQty" << i << ",";
         for (int i = 1; i <= 10; ++i) out << "OfferPx" << i << ",OfferQty" << i << ",";
-        out << "OuterSeq,FrameIdx,RecIdx\n";
+        out << "LocalTime,RecIdx,OuterSeq\n";
     }
 
     // 价格字段精度待确认（此处以 ×10000 输出，即 4 位小数）
@@ -334,7 +332,7 @@ inline void emit(const Msg& r, uint32_t outer_seq, uint32_t frame_idx, size_t re
         else out << "0,0,";
     }
 
-    out << outer_seq << ',' << frame_idx << ',' << rec_idx << '\n';
+    out << local_time << ',' << rec_idx << ',' << outer_seq << '\n';
 }
 
 }  // namespace ua3202

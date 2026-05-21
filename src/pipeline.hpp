@@ -81,25 +81,22 @@ class Handler {
 public:
     void ConfigureTypes(std::vector<ActiveType> types) { types_ = std::move(types); }
 
-    void OnFrame(const StepFrameItem* frame, uint32_t& frame_idx) {
+    void OnFrame(const StepFrameItem* frame, const std::string& local_time, uint64_t& rec_idx) {
         for (auto& t : types_) {
             if (t.category_id != frame->category_id || t.msg_type != frame->msg_type) continue;
 
-            ++frame_idx;
-
             if (frame->payload_len == 0) {
-                spdlog::warn("[pipeline] frame#{} payload 为空，跳过 msg_seq_id={}", frame_idx, frame->msg_seq_id);
+                spdlog::warn("[pipeline] frame msg_seq_id={} payload 为空，跳过", frame->msg_seq_id);
                 return;
             }
-            spdlog::debug("[pipeline] frame#{} msg_seq_id={} sending_time={} payload_len={}", frame_idx, frame->msg_seq_id, frame->sending_time, frame->payload_len);
+            spdlog::debug("[pipeline] frame msg_seq_id={} sending_time={} payload_len={}", frame->msg_seq_id, frame->sending_time, frame->payload_len);
 
             switch ((uint64_t(t.category_id) << 32) | t.msg_type) {
                 case (uint64_t(9) << 32) | 5803: {
                     ua5803::Parser parser(frame->payload, frame->payload_len);
                     ua5803::Msg    rec;
-                    size_t         rec_idx = 0;
                     while (parser.next(rec)) {
-                        ua5803::emit(rec, frame->msg_seq_id, frame_idx, rec_idx++, t.dedup, *t.out);
+                        ua5803::emit(rec, frame->msg_seq_id, local_time, rec_idx++, t.dedup, *t.out);
                         spdlog::trace("[pipeline] emit 成功，TickTime {}", rec.tick_time);
                     }
                     break;
@@ -107,9 +104,8 @@ public:
                 case (uint64_t(6) << 32) | 3202: {
                     ua3202::Parser parser(frame->payload, frame->payload_len);
                     ua3202::Msg    rec;
-                    size_t         rec_idx = 0;
                     while (parser.next(rec))
-                        ua3202::emit(rec, frame->msg_seq_id, frame_idx, rec_idx++, t.dedup, *t.out);
+                        ua3202::emit(rec, frame->msg_seq_id, local_time, rec_idx++, t.dedup, *t.out);
                     break;
                 }
                 default:
@@ -430,7 +426,7 @@ private:
 class Worker {
     Handler  handler_;
     volatile bool running_ = true;
-    uint32_t frame_idx_ = 0;
+    uint64_t global_rec_idx_ = 1;
 public:
     void ConfigureTypes(std::vector<ActiveType> types) { handler_.ConfigureTypes(std::move(types)); }
     void Stop() { running_ = false; }
@@ -439,7 +435,11 @@ public:
         StepFrameItem* item = nullptr;
         while (running_) {
             if (q.try_pop(item)) {
-                handler_.OnFrame(item, frame_idx_);
+                timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                std::string local_time = utils::fmtPktTime(ts);
+
+                handler_.OnFrame(item, local_time, global_rec_idx_);
                 pool.free(item);
                 pending->fetch_sub(1, std::memory_order_release);
             } else {
@@ -447,7 +447,11 @@ public:
             }
         }
         while (q.try_pop(item)) {
-            handler_.OnFrame(item, frame_idx_);
+            timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            std::string local_time = utils::fmtPktTime(ts);
+
+            handler_.OnFrame(item, local_time, global_rec_idx_);
             pool.free(item);
             pending->fetch_sub(1, std::memory_order_release);
         }

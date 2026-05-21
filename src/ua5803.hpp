@@ -28,7 +28,6 @@ struct Msg {
     int64_t     qty_e3        = 0;   // Qty × 1000
     int64_t     money_e5      = 0;   // TradeMoney × 10^5
     std::string bs_flag;             // 'B'/'S'/'N' 或状态记录时 "SUSP"/"OCALL"/"START"
-    bool        valid         = false;
 };
 
 // PMAP 位布局（readFast 读出的 14-bit 值）:
@@ -103,7 +102,6 @@ public:
             return false;
         }
 
-        rec.valid = true;
         return true;
     }
 
@@ -122,7 +120,7 @@ private:
 // 跨 TCP 流去重: key = (channel << 32) | uint32_t(biz_index)
 inline std::unordered_set<uint64_t> g_seen;
 
-inline void emit(const Msg& r, uint32_t outer_seq, uint32_t frame_idx, size_t rec_idx, bool dedup, std::ostream& out) {
+inline void emit(const Msg& r, uint32_t outer_seq, const std::string& local_time, uint64_t rec_idx, bool dedup, std::ostream& out) {
     if (dedup) {
         uint64_t key = (uint64_t(r.channel) << 32) | uint32_t(r.biz_index);
         if (!g_seen.insert(key).second) return;
@@ -131,7 +129,7 @@ inline void emit(const Msg& r, uint32_t outer_seq, uint32_t frame_idx, size_t re
     static bool header_done = false;
     if (!header_done) {
         header_done = true;
-        out << "BizIndex,Channel,SecurityID,TickTime,Type,BuyOrderNO,SellOrderNO,Price,Qty,TradeMoney,TickBSFlag,OuterSeq,FrameIdx,RecIdx\n";
+        out << "BizIndex,Channel,SecurityID,TickTime,Type,BuyOrderNO,SellOrderNO,Price,Qty,TradeMoney,TickBSFlag,LocalTime,RecIdx,OuterSeq\n";
     }
 
     out << r.biz_index << ','
@@ -145,9 +143,9 @@ inline void emit(const Msg& r, uint32_t outer_seq, uint32_t frame_idx, size_t re
         << utils::fmtDecFixed(r.qty_e3, 3) << ','
         << utils::fmtDecFixed(r.money_e5, 5) << ','
         << (r.bs_flag.empty() ? "?" : r.bs_flag) << ','
-        << outer_seq << ','
-        << frame_idx << ','
-        << rec_idx << '\n';
+        << local_time << ','
+        << rec_idx << ','
+        << outer_seq << '\n';
 }
 
 }  // namespace ua5803
