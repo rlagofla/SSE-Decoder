@@ -53,39 +53,39 @@ public:
         if (fr_.empty()) return false;
 
         // pmap
-        if (!fr_.readNum<utils::FastOp::None>(rec.pmap_raw)) return false;
+        if (!fr_.readNum<utils::FastOp::None>(rec.pmap_raw)) { spdlog::warn("[ua5803] FAST 字段读取失败"); return false; };
         fr_.setPmap(rec.pmap_raw);
 
         // bit13: TID
-        if (!fr_.readNum<utils::FastOp::Copy>(13, last_template_id_, rec.template_id)) return false;
+        if (!fr_.readNum<utils::FastOp::Copy>(13, last_template_id_, rec.template_id)) { spdlog::warn("[ua5803] FAST 字段读取失败"); return false; };
         if (rec.template_id != 5803) {
             spdlog::warn("[ua5803] TID 异常: {}", rec.template_id);
             return false;
         }
 
-        if (!fr_.readNum<utils::FastOp::Inc>(12, last_biz_index_, rec.biz_index)) return false;
-        if (!fr_.readNum<utils::FastOp::Copy>(11, last_channel_, rec.channel)) return false;
+        if (!fr_.readNum<utils::FastOp::Inc>(12, last_biz_index_, rec.biz_index)) { spdlog::warn("[ua5803] FAST 字段读取失败"); return false; };
+        if (!fr_.readNum<utils::FastOp::Copy>(11, last_channel_, rec.channel)) { spdlog::warn("[ua5803] FAST 字段读取失败"); return false; };
 
-        if (!fr_.readString<utils::FastOp::Copy>(10, last_sec_id_, rec.security_id)) return false;
-        if (rec.security_id.size() != 6) return false;
+        if (!fr_.readString<utils::FastOp::Copy>(10, last_sec_id_, rec.security_id)) { spdlog::warn("[ua5803] FAST 字段读取失败"); return false; };
+        if (rec.security_id.size() != 6) { spdlog::warn("[ua5803] FAST 字段读取失败"); return false; };
 
-        if (!fr_.readNum<utils::FastOp::CopyNull>(9, last_tick_time_, rec.tick_time)) return false;
+        if (!fr_.readNum<utils::FastOp::CopyNull>(9, last_tick_time_, rec.tick_time)) { spdlog::warn("[ua5803] FAST 字段读取失败"); return false; };
 
         std::string action_str;
-        if (!fr_.readString<utils::FastOp::Copy>(8, last_action_str_, action_str)) return false;
-        if (action_str.size() != 1) return false;
+        if (!fr_.readString<utils::FastOp::Copy>(8, last_action_str_, action_str)) { spdlog::warn("[ua5803] FAST 字段读取失败"); return false; };
+        if (action_str.size() != 1) { spdlog::warn("[ua5803] FAST 字段读取失败"); return false; };
         rec.action = action_str[0];
 
-        if (!fr_.readNum<utils::FastOp::DefaultNull>(7, rec.buy_order_no)) return false;
-        if (!fr_.readNum<utils::FastOp::DefaultNull>(6, rec.sell_order_no)) return false;
-        if (!fr_.readNum<utils::FastOp::DefaultNull>(5, rec.price_e3)) return false;
-        if (!fr_.readNum<utils::FastOp::DefaultNull>(4, rec.qty_e3)) return false;
-        if (!fr_.readNum<utils::FastOp::DefaultNull>(3, rec.money_e5)) return false;
+        if (!fr_.readNum<utils::FastOp::DefaultNull>(7, rec.buy_order_no)) { spdlog::warn("[ua5803] FAST 字段读取失败"); return false; };
+        if (!fr_.readNum<utils::FastOp::DefaultNull>(6, rec.sell_order_no)) { spdlog::warn("[ua5803] FAST 字段读取失败"); return false; };
+        if (!fr_.readNum<utils::FastOp::DefaultNull>(5, rec.price_e3)) { spdlog::warn("[ua5803] FAST 字段读取失败"); return false; };
+        if (!fr_.readNum<utils::FastOp::DefaultNull>(4, rec.qty_e3)) { spdlog::warn("[ua5803] FAST 字段读取失败"); return false; };
+        if (!fr_.readNum<utils::FastOp::DefaultNull>(3, rec.money_e5)) { spdlog::warn("[ua5803] FAST 字段读取失败"); return false; };
 
         // 'T' 的 money 单位已是 ×10^5；'A'/'D'/'C' 是 ×10^3，统一乘 100 转为 ×10^5
         if (rec.action != 'T') rec.money_e5 *= 100;
 
-        if (!fr_.readString<utils::FastOp::Copy>(2, last_bs_flag_, rec.bs_flag)) return false;
+        if (!fr_.readString<utils::FastOp::Default>(2, rec.bs_flag)) { spdlog::warn("[ua5803] FAST 字段读取失败"); return false; };
 
         // 该读的都读完了，现在是逻辑判断阶段
         // 非状态记录的 BSFlag 只能是 B/S/N
@@ -114,7 +114,6 @@ private:
     std::string last_sec_id_;
     uint32_t    last_tick_time_ = 0;
     std::string last_action_str_;
-    std::string last_bs_flag_;
 };
 
 // 跨 TCP 流去重: key = (channel << 32) | uint32_t(biz_index)

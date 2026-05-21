@@ -24,6 +24,7 @@ enum class FastOp {
     Copy,         // PMAP=0: 字典; PMAP=1: 读取更新字典
     CopyNull,     // PMAP=0: 字典; PMAP=1: 读取 Nullable (非 Null 更新字典)
     Inc,          // PMAP=0: 字典+1; PMAP=1: 读取更新字典
+    Default,      // PMAP=0: 默认值; PMAP=1: 读取，不更新字典
     DefaultNull   // PMAP=0: 返回 0; PMAP=1: 读取 Nullable (Null 返回 0)，无字典
 };
 
@@ -38,6 +39,7 @@ public:
     void setPmap(uint64_t pmap) { pmap_ = pmap; }
     bool hasBit(int bit) const { return (pmap_ & (1ull << bit)) != 0; }
 
+    // 1. bit + dict + out (Copy, Inc, CopyNull, Default)
     template <FastOp Op, typename T>
     bool readNum(int bit, T& dict_val, T& out) {
         if constexpr (Op == FastOp::Copy) {
@@ -62,9 +64,15 @@ public:
         return false;
     }
 
+    // 2. bit + out (Default, DefaultNull)
     template <FastOp Op, typename T>
     bool readNum(int bit, T& out) {
-        if constexpr (Op == FastOp::DefaultNull) {
+        if constexpr (Op == FastOp::Default) {
+            if (!hasBit(bit)) { out = 0; return true; }
+            uint64_t v; if (!_readUint(v)) return false;
+            out = static_cast<T>(v); return true;
+        }
+        else if constexpr (Op == FastOp::DefaultNull) {
             if (!hasBit(bit)) { out = 0; return true; }
             uint64_t v; if (!_readUint(v)) return false;
             out = (v == 0) ? 0 : static_cast<T>(v - 1); return true;
@@ -72,6 +80,7 @@ public:
         return false;
     }
 
+    // 3. out only (None, NoneNull)
     template <FastOp Op, typename T>
     bool readNum(T& out) {
         if constexpr (Op == FastOp::None) {
@@ -85,6 +94,7 @@ public:
         return false;
     }
 
+    // String: bit + dict + out (Copy)
     template <FastOp Op>
     bool readString(int bit, std::string& dict_val, std::string& out) {
         if constexpr (Op == FastOp::Copy) {
@@ -95,6 +105,17 @@ public:
         return false;
     }
 
+    // String: bit + out (Copy)
+    template <FastOp Op>
+    bool readString(int bit, std::string& out) {
+        if constexpr (Op == FastOp::Default) {
+            if (!hasBit(bit)) { out = "Default"; return true; }
+            return _readString(out);
+        }
+        return false;
+    }
+
+    // String: out only (None)
     template <FastOp Op>
     bool readString(std::string& out) {
         if constexpr (Op == FastOp::None) {
@@ -187,6 +208,16 @@ inline std::string fmtTickTime(uint32_t t) {
     uint32_t hh = t / 1000000;
     char b[16];
     std::snprintf(b, sizeof(b), "%02u:%02u:%02u.%02u", hh, mm, ss, xx);
+    return b;
+}
+
+
+inline std::string fmtSnapTime(uint32_t t) {
+    uint32_t ss = t % 100;
+    uint32_t mm = (t / 100) % 100;
+    uint32_t hh = (t / 10000) % 100;
+    char b[16];
+    std::snprintf(b, sizeof(b), "%02u:%02u:%02u", hh, mm, ss);
     return b;
 }
 
