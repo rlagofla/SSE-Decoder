@@ -48,32 +48,6 @@ struct ActiveType {
 };
 
 // =========================================================
-// [ObjectPool] 对象池
-// =========================================================
-class ObjectPool {
-    std::vector<StepFrameItem> storage_;
-    rigtorp::MPMCQueue<StepFrameItem*> free_queue_;
-public:
-    explicit ObjectPool(size_t capacity) : free_queue_(capacity) {
-        storage_.resize(capacity);
-        for (size_t i = 0; i < capacity; ++i)
-            (void)free_queue_.try_push(&storage_[i]);
-    }
-
-    StepFrameItem* alloc() {
-        StepFrameItem* item = nullptr;
-        if (free_queue_.try_pop(item)) return item;
-        return nullptr;
-    }
-
-    void free(StepFrameItem* ptr) {
-        if (ptr) {
-            while (!free_queue_.try_push(ptr)) _mm_pause();
-        }
-    }
-};
-
-// =========================================================
 // [Handler] 业务帧分发
 // =========================================================
 class Handler {
@@ -122,7 +96,7 @@ public:
 // [Assembler] TCP 序列号校验 + 字节流切帧入队
 // =========================================================
 class Assembler {
-    ObjectPool& pool_;
+    utils::ObjectPool<StepFrameItem>& pool_;
     rigtorp::MPMCQueue<StepFrameItem*>& out_queue_;
     std::atomic<size_t>* pending_;
 
@@ -159,7 +133,7 @@ class Assembler {
     bool isLuan = false;
 
 public:
-    Assembler(ObjectPool& pool, rigtorp::MPMCQueue<StepFrameItem*>& q, std::atomic<size_t>* pending)
+    Assembler(utils::ObjectPool<StepFrameItem>& pool, rigtorp::MPMCQueue<StepFrameItem*>& q, std::atomic<size_t>* pending)
         : pool_(pool), out_queue_(q), pending_(pending) {}
 
     void OnTcpData(const uint8_t* data, size_t len, uint32_t seq) {
@@ -431,7 +405,7 @@ public:
     void ConfigureTypes(std::vector<ActiveType> types) { handler_.ConfigureTypes(std::move(types)); }
     void Stop() { running_ = false; }
 
-    void Run(rigtorp::MPMCQueue<StepFrameItem*>& q, ObjectPool& pool, std::atomic<size_t>* pending) {
+    void Run(rigtorp::MPMCQueue<StepFrameItem*>& q, utils::ObjectPool<StepFrameItem>& pool, std::atomic<size_t>* pending) {
         StepFrameItem* item = nullptr;
         while (running_) {
             if (q.try_pop(item)) {
@@ -462,7 +436,7 @@ public:
 // [Pipeline] 顶层控制器
 // =========================================================
 class Pipeline {
-    ObjectPool pool_;
+    utils::ObjectPool<StepFrameItem> pool_;
     rigtorp::MPMCQueue<StepFrameItem*> queue_;
     Worker worker_;
     std::thread worker_thread_;

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
+#include <immintrin.h>
 #include <limits>
 #include <string>
 #include <utility>
@@ -12,6 +13,8 @@
 
 #include <zlib.h>
 #include <TcpReassembly.h>
+
+#include "MPMCQueue.h"
 
 namespace utils {
 
@@ -235,5 +238,33 @@ inline std::string fmtPktTime(const timespec& ts) {
 inline bool portMatch(const pcpp::ConnectionData& c, uint16_t port) {
     return port == 0 || c.srcPort == port || c.dstPort == port;
 }
+
+// ---- 对象池 ----
+// 预分配 capacity 个 T 实例，alloc/free 走 MPMCQueue<T*>。
+// 适用 SPSC / MPMC 任意线程模式（当前底层用 MPMCQueue）。
+template <typename T>
+class ObjectPool {
+    std::vector<T> storage_;
+    rigtorp::MPMCQueue<T*> free_queue_;
+
+public:
+    explicit ObjectPool(size_t capacity) : free_queue_(capacity) {
+        storage_.resize(capacity);
+        for (size_t i = 0; i < capacity; ++i)
+            (void)free_queue_.try_push(&storage_[i]);
+    }
+
+    T* alloc() {
+        T* item = nullptr;
+        if (free_queue_.try_pop(item)) return item;
+        return nullptr;
+    }
+
+    void free(T* ptr) {
+        if (ptr) {
+            while (!free_queue_.try_push(ptr)) _mm_pause();
+        }
+    }
+};
 
 }  // namespace utils

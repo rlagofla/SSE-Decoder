@@ -13,6 +13,7 @@ data/
 libs/
 .cache/
 log/
+ignore/
 
 CMakeLists.txt
 .DS_Store
