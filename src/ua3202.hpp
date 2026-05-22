@@ -61,7 +61,6 @@ struct PriceLevel {
 };
 
 struct Msg {
-    uint64_t    pmap_raw              = 0;
     uint64_t    template_id           = 0;
     uint32_t    tick_time             = 0;
     uint32_t    data_status           = 0;
@@ -120,8 +119,9 @@ public:
         if (fr_.empty()) return false;
 
         // pmap
-        if (!fr_.readNum<utils::FastOp::None>(rec.pmap_raw)) { spdlog::warn("[ua3202] FAST 字段读取失败"); return false; };
-        fr_.setPmap(rec.pmap_raw);
+        uint64_t pmap = 0;
+        if (!fr_.readNum<utils::FastOp::None>(pmap)) { spdlog::warn("[ua3202] FAST 字段读取失败"); return false; };
+        fr_.setPmap(pmap);
 
         // bit48: TID（期望 3202）
         if (!fr_.readNum<utils::FastOp::Copy>(48, last_template_id_, rec.template_id)) { spdlog::warn("[ua3202] FAST 字段读取失败"); return false; };

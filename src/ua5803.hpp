@@ -15,7 +15,6 @@ namespace ua5803 {
 
 // 一条逐笔记录
 struct Msg {
-    uint64_t    pmap_raw      = 0;
     uint64_t    template_id   = 0;   // 期望 5803
     uint64_t    biz_index     = 0;
     uint32_t    channel       = 0;
@@ -53,8 +52,9 @@ public:
         if (fr_.empty()) return false;
 
         // pmap
-        if (!fr_.readNum<utils::FastOp::None>(rec.pmap_raw)) { spdlog::warn("[ua5803] FAST 字段读取失败"); return false; };
-        fr_.setPmap(rec.pmap_raw);
+        uint64_t pmap = 0;
+        if (!fr_.readNum<utils::FastOp::None>(pmap)) { spdlog::warn("[ua5803] FAST 字段读取失败"); return false; };
+        fr_.setPmap(pmap);
 
         // bit13: TID
         if (!fr_.readNum<utils::FastOp::Copy>(13, last_template_id_, rec.template_id)) { spdlog::warn("[ua5803] FAST 字段读取失败"); return false; };
