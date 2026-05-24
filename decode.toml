@@ -1,26 +1,20 @@
 # decode.toml — 上交所行情解码器配置
 
 [run]
-mode   = "pcap"              # "pcap" 读文件 | "iface" 监听网卡
-source = "data/0508/20260508_enp1s0f1np1-2.pcap"   # pcap 文件路径 或 网卡名称（如 "eth0"）
+mode   = "pcap"              # "pcap" 读 pcap 文件 | "iface" 在线抓包直通
+source = "data/0508/20260508_enp1s0f1np1-2.pcap"   # pcap 文件路径 或 网卡名
 port   = 9129               # TCP 端口过滤（0 = 不过滤）
 
 [log]
 level = "info"              # trace / debug / info / warn / error
 
 [iface]
-backend               = "pcap"         # "pcap" | "efvi"
-bin_dir               = "bin/"
-bin_prefix            = ""              # 空 → cap_<iface>
-segment_bytes         = 268435456       # 256 MiB
-promisc               = true
-snaplen               = 65535
-writer_cpu            = -1              # -1 = 不绑核
-reader_cpu            = -1
-open_max_attempts     = 30
-open_retry_ms         = 2000
-delete_bin_after_read = false
-flush_csv_per_segment = true            # 分卷边界刷 CSV（tail -f 实时可见）
+backend               = "pcap"         # iface 模式后端："pcap" | "efvi"
+promisc               = true           # 混杂模式
+snaplen               = 65535          # 截取长度
+capture_cpu           = -1             # 抓包+解码主线程绑核（-1 = 不绑核）
+open_max_attempts     = 30             # 网卡打开重试次数
+open_retry_ms         = 2000           # 网卡打开重试间隔
 
 # 每个 [[decode]] 块对应一种消息类型
 [[decode]]
