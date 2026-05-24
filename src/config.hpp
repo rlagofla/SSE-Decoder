@@ -16,6 +16,11 @@ struct IfaceConfig {
     int         capture_cpu            = -1;       // iface 抓包+解码主线程绑核（-1 = 不绑核）
     int         open_max_attempts      = 30;
     int         open_retry_ms          = 2000;
+
+    // pcap dump（可选）：若 dump_pcap 非空，则把抓到的每个 frame 写入该 pcap 文件
+    std::string dump_pcap              = "";       // 空 = 不 dump；非空 = pcap 输出路径
+    size_t      dump_pool_size         = 1u << 20; // RawPacketBuf 池容量（默认 1M ≈ 2GB）
+    int         dump_cpu               = -1;       // dump 线程绑核（-1 = 不绑核）
 };
 
 struct TypeConfig {
@@ -67,6 +72,9 @@ inline Config loadConfig(const std::string& path) {
     cfg.iface.capture_cpu   = static_cast<int>(tbl["iface"]["capture_cpu"].value_or(int64_t(-1)));
     cfg.iface.open_max_attempts = static_cast<int>(tbl["iface"]["open_max_attempts"].value_or(int64_t(30)));
     cfg.iface.open_retry_ms     = static_cast<int>(tbl["iface"]["open_retry_ms"].value_or(int64_t(2000)));
+    cfg.iface.dump_pcap         = tbl["iface"]["dump_pcap"].value_or(std::string(""));
+    cfg.iface.dump_pool_size    = static_cast<size_t>(tbl["iface"]["dump_pool_size"].value_or(int64_t(1) << 20));
+    cfg.iface.dump_cpu          = static_cast<int>(tbl["iface"]["dump_cpu"].value_or(int64_t(-1)));
 
     if (cfg.source.empty())
         throw std::runtime_error("配置文件缺少 run.source 字段");

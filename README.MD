@@ -51,6 +51,11 @@ capture_cpu           = 0         # 抓包+解码主线程绑核 (-1 为不绑)
 open_max_attempts     = 30        # 启动时打开网卡重试次数
 open_retry_ms         = 2000      # 重试间隔 (ms)
 
+# 可选：旁路把抓到的 frame dump 成 pcap (类似 tcpdump -w)
+dump_pcap             = ""        # 空 = 不 dump；非空 = pcap 输出路径
+dump_pool_size        = 1048576   # dump 缓冲池容量（默认 1M ≈ 2GB 内存）
+dump_cpu              = -1        # dump 线程绑核
+
 [[decode]]
 category_id = 9
 msg_type    = 5803
@@ -70,3 +75,5 @@ dedup       = true
 ### [iface]
 - `backend`: 抓包引擎。`efvi` 仅支持 Solarflare 网卡。
 - `capture_cpu`: 抓包+解码主线程绑核。-1 为不绑。Worker 线程（解 frame）由 Pipeline 内部管理，目前未绑核。
+- `dump_pcap`: 可选 pcap dump 路径。设置后会启动独立 dump 线程旁路写 pcap，**不影响解码路径性能**。当池满 / frame 超过 2048 字节时会丢包并在日志中 error 告警；只要没看到 error 就是完整流量，可直接用 wireshark 等工具回看。
+- `dump_pool_size` / `dump_cpu`: dump 路径的缓冲池容量与线程绑核。

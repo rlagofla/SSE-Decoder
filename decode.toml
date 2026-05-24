@@ -16,6 +16,12 @@ capture_cpu           = -1             # 抓包+解码主线程绑核（-1 = 不
 open_max_attempts     = 30             # 网卡打开重试次数
 open_retry_ms         = 2000           # 网卡打开重试间隔
 
+# 可选：把抓到的每个 frame 旁路 dump 成 pcap 文件（用法类似 tcpdump -w）
+# dump 路径满或 frame 超过 2048 字节会丢包并 error 日志告警；不丢即完整。
+dump_pcap             = ""             # 空 = 不 dump；非空 = pcap 输出路径，如 "out/cap.pcap"
+dump_pool_size        = 1048576        # RawPacketBuf 池容量（默认 1M，约 2GB 内存）
+dump_cpu              = -1             # dump 线程绑核（-1 = 不绑核）
+
 # 每个 [[decode]] 块对应一种消息类型
 [[decode]]
 category_id = 9
