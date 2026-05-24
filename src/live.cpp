@@ -14,7 +14,7 @@
 #include <arpa/inet.h>
 #include <spdlog/spdlog.h>
 
-#include "SPSCQueue.h"
+#include <rigtorp/SPSCQueue.h>
 #include "capture_backend.hpp"
 #include "thread_affinity.hpp"
 #include "utils.hpp"

@@ -1,7 +1,7 @@
 #ifdef USE_EFVI
 
 #include "capture_backend.hpp"
-#include "Efvi.h"
+#include <pollnet/Efvi.h>
 
 #include <algorithm>
 #include <chrono>

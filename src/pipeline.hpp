@@ -16,7 +16,7 @@
 
 #include <spdlog/spdlog.h>
 
-#include "MPMCQueue.h"
+#include <rigtorp/MPMCQueue.h>
 #include "ua3202.hpp"
 #include "ua5803.hpp"
 #include "utils.hpp"

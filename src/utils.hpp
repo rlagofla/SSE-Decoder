@@ -14,7 +14,7 @@
 #include <zlib.h>
 #include <TcpReassembly.h>
 
-#include "MPMCQueue.h"
+#include <rigtorp/MPMCQueue.h>
 
 namespace utils {
 

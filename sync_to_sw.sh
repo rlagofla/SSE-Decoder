@@ -23,6 +23,12 @@ rsync -avzP \
     --exclude 'doc' \
     --exclude 'py' \
     --exclude 'research' \
+    --exclude '.gitignore' \
+    --exclude '.python-version' \
+    --exclude 'decode.toml' \
+    --exclude 'pyproject.toml' \
+    --exclude 'sync_to_sw.sh' \
+    --exclude 'uv.lock' \
     ./ $TARGET:$REMOTE_DIR/
 
 echo "同步完成！"
