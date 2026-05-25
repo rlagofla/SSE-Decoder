@@ -30,11 +30,11 @@ inline constexpr size_t kTcpDataPoolSize = 32768;  // 32768 × ~65KB ≈ 2GB
 // [数据结构]
 // =========================================================
 
-struct StepFrameItem {
+struct FrameItem {
     uint32_t category_id  = 0;
     uint32_t msg_type     = 0;
-    uint32_t msg_seq_id   = 0;
-    char     sending_time[24] = {0};
+    uint32_t frame_seq    = 0;   // 帧头 16-19 字节，按 (category_id,msg_type) 单调 +1
+    bool     compressed   = false;
 
     size_t   payload_len  = 0;
     uint8_t  payload[64 * 1024];
@@ -55,22 +55,22 @@ class Handler {
 public:
     void ConfigureTypes(std::vector<ActiveType> types) { types_ = std::move(types); }
 
-    void OnFrame(const StepFrameItem* frame, const std::string& local_time, uint64_t& rec_idx) {
+    void OnFrame(const FrameItem* frame, const std::string& local_time, uint64_t& rec_idx) {
         for (auto& t : types_) {
             if (t.category_id != frame->category_id || t.msg_type != frame->msg_type) continue;
 
             if (frame->payload_len == 0) {
-                spdlog::warn("[pipeline] frame msg_seq_id={} payload 为空，跳过", frame->msg_seq_id);
+                spdlog::warn("[pipeline] frame frame_seq={} payload 为空，跳过", frame->frame_seq);
                 return;
             }
-            spdlog::debug("[pipeline] frame msg_seq_id={} sending_time={} payload_len={}", frame->msg_seq_id, frame->sending_time, frame->payload_len);
+            spdlog::debug("[pipeline] frame frame_seq={} compressed={} payload_len={}", frame->frame_seq, frame->compressed, frame->payload_len);
 
             switch ((uint64_t(t.category_id) << 32) | t.msg_type) {
                 case (uint64_t(9) << 32) | 5803: {
                     ua5803::Parser parser(frame->payload, frame->payload_len);
                     ua5803::Msg    rec;
                     while (parser.next(rec)) {
-                        ua5803::emit(rec, frame->msg_seq_id, local_time, rec_idx++, t.dedup, *t.out);
+                        ua5803::emit(rec, frame->frame_seq, local_time, rec_idx++, t.dedup, *t.out);
                         spdlog::trace("[pipeline] emit 成功，TickTime {}", rec.tick_time);
                     }
                     break;
@@ -79,7 +79,7 @@ public:
                     ua3202::Parser parser(frame->payload, frame->payload_len);
                     ua3202::Msg    rec;
                     while (parser.next(rec))
-                        ua3202::emit(rec, frame->msg_seq_id, local_time, rec_idx++, t.dedup, *t.out);
+                        ua3202::emit(rec, frame->frame_seq, local_time, rec_idx++, t.dedup, *t.out);
                     break;
                 }
                 default:
@@ -94,20 +94,31 @@ public:
 
 // =========================================================
 // [Assembler] TCP 序列号校验 + 字节流切帧入队
+//
+// 帧格式（40B 定长头 + payload）:
+//   0-3   Magic 0x0004C453 (大端)
+//   4-7   整帧长度（含 40B 头, 大端）
+//   8-11  category_id (大端)
+//   12-15 msg_type    (大端)
+//   16-19 frame_seq   (大端, 按 (cat,type) 单调 +1)
+//   20-23 = 0
+//   24-27 时间戳/相关
+//   28-31 0 或 0x08000000
+//   32-35 压缩标志 0/1
+//   36-39 0/1/0xF
 // =========================================================
 class Assembler {
-    utils::ObjectPool<StepFrameItem>& pool_;
-    rigtorp::MPMCQueue<StepFrameItem*>& out_queue_;
+    utils::ObjectPool<FrameItem>& pool_;
+    rigtorp::MPMCQueue<FrameItem*>& out_queue_;
     std::atomic<size_t>* pending_;
 
     bool     seq_initialized_ = false;
     uint32_t expected_seq_    = 0;
 
-    static constexpr uint8_t kMagicBytes[13] = {
-        '8','=','S','T','E','P','.','1','.','0','.','0','\x01'
-    };
-    static constexpr size_t kMagicLen = 13;
-    static constexpr size_t kBufCap   = 1u << 20;  // 1MB
+    static constexpr uint32_t kMagic    = 0x0004C453;
+    static constexpr size_t   kHeaderLen = 40;
+    static constexpr size_t   kMaxFrame  = 16u * 1024u * 1024u;
+    static constexpr size_t   kBufCap    = 1u << 20;  // 1MB
 
     uint8_t  buf_[kBufCap];
     size_t   rpos_ = 0;
@@ -133,7 +144,7 @@ class Assembler {
     bool isLuan = false;
 
 public:
-    Assembler(utils::ObjectPool<StepFrameItem>& pool, rigtorp::MPMCQueue<StepFrameItem*>& q, std::atomic<size_t>* pending)
+    Assembler(utils::ObjectPool<FrameItem>& pool, rigtorp::MPMCQueue<FrameItem*>& q, std::atomic<size_t>* pending)
         : pool_(pool), out_queue_(q), pending_(pending) {}
 
     void OnTcpData(const uint8_t* data, size_t len, uint32_t seq) {
@@ -178,86 +189,48 @@ private:
             const uint8_t* base  = buf_ + rpos_;
             size_t         avail = wpos_ - rpos_;
 
-            // 1. 如果缓冲区为空（恰好处理完），或者长度短于一个魔数，直接退出等待下一个包
-            // 这是一个完全正常、最常见（avail == 0）的退出条件。
-            if (avail < kMagicLen) {
-                return;
-            }
+            // 1. 长度不够读魔数+长度（8 字节），等下一个包
+            if (avail < 8) return;
 
-            // 2. 尝试寻找魔数
-            auto* p = static_cast<const uint8_t*>(memmem(base, avail, kMagicBytes, kMagicLen));
-            if (!p) {
-                // 找不到魔数，但总长度大于等于 13。说明这里面是垃圾数据。
-                // 仅保留最后 12 个字节（以防魔数被从中间切断），其他的丢弃。
-                spdlog::error("[assembler] cnt={} luan={} seq={} exp={}, 未找到魔数，丢弃 {} 字节 {}", cnt, isLuan, seq, expected_seq_, avail - (kMagicLen - 1), getBuf());
-                rpos_ = wpos_ - (kMagicLen - 1);
-                return;
-            }
-
-            // 3. 找到了魔数，但不在开头，说明魔数前有垃圾数据
-            if (p > base) {
-                spdlog::error("[assembler] cnt={} luan={} seq={} exp={}, 魔数前有 {} 字节无效数据，跳过 {}", cnt, isLuan, seq, expected_seq_, p - base, getBuf());
+            // 2. 检查魔数；不对则按字节滑动找下一个
+            uint32_t magic = utils::readBE32(base);
+            if (magic != kMagic) {
+                // 在剩余数据里找下一个魔数
+                const uint8_t magic_bytes[4] = {0x00, 0x04, 0xC4, 0x53};
+                auto* p = static_cast<const uint8_t*>(memmem(base, avail, magic_bytes, 4));
+                if (!p) {
+                    spdlog::error("[assembler] cnt={} luan={} seq={} exp={}, 未找到魔数，丢弃 {} 字节 {}",
+                                  cnt, isLuan, seq, expected_seq_, avail - 3, getBuf());
+                    rpos_ = wpos_ - 3;  // 保留最后 3 字节，魔数可能被切断
+                    return;
+                }
+                spdlog::error("[assembler] cnt={} luan={} seq={} exp={}, 魔数前有 {} 字节无效数据，跳过 {}",
+                              cnt, isLuan, seq, expected_seq_, p - base, getBuf());
                 rpos_ += (p - base);
-                base = p; 
-                avail = wpos_ - rpos_;
-            }
-
-            // 4. 解析 `9=BodyLength`。先确保长度足够读 `9=`
-            if (avail < kMagicLen + 4) {
-                return; // 等下一个包
-            }
-
-            if (base[kMagicLen] != '9' || base[kMagicLen + 1] != '=') {
-                spdlog::error("[assembler] magic 后紧跟的不是 9=，跳过异常魔数");
-                rpos_ += kMagicLen;
-                continue;
-            }
-            
-            // 找 9=xxx\x01 的结束符
-            auto* soh = static_cast<const uint8_t*>(
-                memchr(base + kMagicLen + 2, '\x01', avail - kMagicLen - 2));
-            if (!soh) {
-                return; // 还没收全这个 tag，等下一个包
-            }
-
-            size_t body_len = 0;
-            bool   parse_ok = true;
-            for (auto* q = base + kMagicLen + 2; q < soh; ++q) {
-                if (*q < '0' || *q > '9') { parse_ok = false; break; }
-                body_len = body_len * 10 + (*q - '0');
-            }
-            if (!parse_ok) {
-                spdlog::error("[assembler] 9= 字段值解析失败，跳过异常魔数");
-                rpos_ += kMagicLen;
                 continue;
             }
 
-            // 5. 计算这一帧的完整理论长度
-            size_t nine_field_len = static_cast<size_t>(soh + 1 - (base + kMagicLen));
-            size_t total          = kMagicLen + nine_field_len + body_len + 7; // +7 for 10=000\x01
-            
-            if (total > 16u * 1024u * 1024u) {
-                spdlog::error("[assembler] 帧长度极其异常 total_len={}，跳过魔数");
-                rpos_ += kMagicLen;
+            // 3. 读整帧长度
+            uint32_t total = utils::readBE32(base + 4);
+            if (total < kHeaderLen || total > kMaxFrame) {
+                spdlog::error("[assembler] 帧长度异常 total={}，跳过魔数", total);
+                rpos_ += 4;
                 continue;
             }
 
-            // 6. 检查当前缓冲数据是否足够切出一个完整帧
-            if (avail < total) {
-                // 如果恰好跨包了（例如还差几十字节没到），就停在这里等下一个 TCP Payload 到来
-                return;
-            }
+            // 4. 数据不够，等下一个 TCP 包
+            if (avail < total) return;
 
-            // 7. 能够完整切出！
-            StepFrameItem* item = pool_.alloc();
+            // 5. 切出完整帧
+            FrameItem* item = pool_.alloc();
             while (!item) { _mm_pause(); item = pool_.alloc(); }
 
-            parseStepFrame(base, total, item);
+            parseFrame(base, total, item);
 
             while (!out_queue_.try_push(item)) _mm_pause();
             pending_->fetch_add(1, std::memory_order_release);
-            
-            // 8. 推进缓冲，开始下一次循环以寻找下一个帧（如果当前包带有多个帧）
+
+            // 6. 推进缓冲，循环找下一帧
             rpos_ += total;
         }
     }
@@ -270,127 +243,19 @@ private:
         rpos_ = 0;
     }
 
-    void parseStepFrame(const uint8_t* buf, size_t total_len, StepFrameItem* item) {
-        item->category_id = 0;
-        item->msg_type = 0;
-        item->msg_seq_id = 0;
-        item->sending_time[0] = '\0';
-        item->payload_len = 0;
+    void parseFrame(const uint8_t* buf, size_t total_len, FrameItem* item) {
+        item->category_id = utils::readBE32(buf + 8);
+        item->msg_type    = utils::readBE32(buf + 12);
+        item->frame_seq   = utils::readBE32(buf + 16);
+        item->compressed  = utils::readBE32(buf + 32) != 0;
 
-        size_t pos = kMagicLen;
-        while (pos < total_len && buf[pos] != '\x01') ++pos;
-        if (pos >= total_len) {
-            spdlog::error("[assembler] parseStepFrame: 寻找首个 SOH 越界");
-            return;
+        size_t payload_len = total_len - kHeaderLen;
+        if (payload_len > sizeof(item->payload)) {
+            spdlog::error("[assembler] payload 过长 {} > {}，将被截断", payload_len, sizeof(item->payload));
+            payload_len = sizeof(item->payload);
         }
-        ++pos;
-
-        uint32_t raw_data_len = 0;
-
-        while (pos < total_len) {
-            uint32_t tag_num = 0;
-            size_t tag_start = pos;
-            while (pos < total_len && buf[pos] >= '0' && buf[pos] <= '9') {
-                tag_num = tag_num * 10 + (buf[pos] - '0');
-                ++pos;
-            }
-            if (pos >= total_len || buf[pos] != '=') {
-                spdlog::error("[assembler] parseStepFrame: 解析 Tag 编号异常 (pos={}), tag_start={}", pos, tag_start);
-                break; // Malformed tag
-            }
-            ++pos; // skip '='
-
-            if (tag_num == 10) break; // End of message
-
-            if (tag_num == 96) {
-                item->payload_len = raw_data_len;
-                if (raw_data_len > sizeof(item->payload)) {
-                    spdlog::error("[assembler] payload 过长 {} > {}，将被截断", raw_data_len, sizeof(item->payload));
-                    item->payload_len = sizeof(item->payload);
-                }
-                if (pos + item->payload_len > total_len) {
-                    spdlog::error("[assembler] parseStepFrame: 96 字段 payload 长度越界");
-                    break;
-                }
-                std::memcpy(item->payload, buf + pos, item->payload_len);
-                pos += raw_data_len;
-                if (pos < total_len && buf[pos] == '\x01') {
-                    ++pos;
-                } else {
-                    spdlog::error("[assembler] parseStepFrame: 96 字段结束后未找到预期 SOH");
-                }
-                continue;
-            }
-
-            size_t soh = pos;
-            while (soh < total_len && buf[soh] != '\x01') ++soh;
-            if (soh >= total_len) {
-                spdlog::error("[assembler] parseStepFrame: Tag {} 寻找结束 SOH 越界", tag_num);
-                break;
-            }
-            size_t val_len = soh - pos;
-            const char* val_ptr = reinterpret_cast<const char*>(buf + pos);
-            pos = soh + 1; // skip SOH for next tag
-
-            switch (tag_num) {
-                case 35: {
-                    if (val_len > 2) { // Skip prefix like "UE" or "UA"
-                        uint32_t mt = 0;
-                        for (size_t i = 2; i < val_len; ++i) {
-                            if (val_ptr[i] >= '0' && val_ptr[i] <= '9') {
-                                mt = mt * 10 + (val_ptr[i] - '0');
-                            }
-                        }
-                        item->msg_type = mt;
-                    }
-                    break;
-                }
-                case 10142: {
-                    uint32_t cat = 0;
-                    for (size_t i = 0; i < val_len; ++i) {
-                        if (val_ptr[i] >= '0' && val_ptr[i] <= '9') cat = cat * 10 + (val_ptr[i] - '0');
-                    }
-                    item->category_id = cat;
-                    break;
-                }
-                case 10072: {
-                    uint32_t seq = 0;
-                    for (size_t i = 0; i < val_len; ++i) {
-                        if (val_ptr[i] >= '0' && val_ptr[i] <= '9') seq = seq * 10 + (val_ptr[i] - '0');
-                    }
-                    item->msg_seq_id = seq;
-                    break;
-                }
-                case 95: {
-                    uint32_t len = 0;
-                    for (size_t i = 0; i < val_len; ++i) {
-                        if (val_ptr[i] >= '0' && val_ptr[i] <= '9') len = len * 10 + (val_ptr[i] - '0');
-                    }
-                    raw_data_len = len;
-                    break;
-                }
-                case 52: {
-                    size_t cp_len = std::min(val_len, sizeof(item->sending_time) - 1);
-                    std::strncpy(item->sending_time, val_ptr, cp_len);
-                    item->sending_time[cp_len] = '\0';
-                    break;
-                }
-                case 49: {
-                    if (val_len != 3 || std::strncmp(val_ptr, "VDE", 3) != 0) {
-                        spdlog::warn("[assembler] SenderCompID 异常: {}", std::string(val_ptr, val_len));
-                    }
-                    break;
-                }
-                case 56: {
-                    if (val_len != 3 || std::strncmp(val_ptr, "VSS", 3) != 0) {
-                        spdlog::warn("[assembler] TargetCompID 异常: {}", std::string(val_ptr, val_len));
-                    }
-                    break;
-                }
-                default:
-                    break;
-            }
-        }
+        std::memcpy(item->payload, buf + kHeaderLen, payload_len);
+        item->payload_len = payload_len;
     }
 };
 
@@ -405,8 +270,8 @@ public:
     void ConfigureTypes(std::vector<ActiveType> types) { handler_.ConfigureTypes(std::move(types)); }
     void Stop() { running_ = false; }
 
-    void Run(rigtorp::MPMCQueue<StepFrameItem*>& q, utils::ObjectPool<StepFrameItem>& pool, std::atomic<size_t>* pending) {
-        StepFrameItem* item = nullptr;
+    void Run(rigtorp::MPMCQueue<FrameItem*>& q, utils::ObjectPool<FrameItem>& pool, std::atomic<size_t>* pending) {
+        FrameItem* item = nullptr;
         while (running_) {
             if (q.try_pop(item)) {
                 timespec ts;
@@ -436,8 +301,8 @@ public:
 // [Pipeline] 顶层控制器
 // =========================================================
 class Pipeline {
-    utils::ObjectPool<StepFrameItem> pool_;
-    rigtorp::MPMCQueue<StepFrameItem*> queue_;
+    utils::ObjectPool<FrameItem> pool_;
+    rigtorp::MPMCQueue<FrameItem*> queue_;
     Worker worker_;
     std::thread worker_thread_;
     Assembler assembler_;
